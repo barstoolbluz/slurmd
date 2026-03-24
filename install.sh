@@ -38,6 +38,59 @@ source "${SCRIPT_DIR}/lib/login.sh"
 
 # ── Distribute configs to remote nodes ────────────────────────────────────
 
+# SSH connection mode globals
+SSH_USER=""        # Username for SSH (empty = root mode)
+SSH_SUDO=false     # Whether to use sudo on remote
+
+# Prompt user to select SSH connection mode.
+# Sets SSH_USER and SSH_SUDO globals.
+select_ssh_mode() {
+    echo
+    menu_select "How do you connect to cluster nodes?" \
+        "As root directly (SSH as root@node)" \
+        "As a regular user with sudo (user@node + sudo)"
+
+    case "$REPLY" in
+        1)
+            SSH_USER="root"
+            SSH_SUDO=false
+            log_info "Will connect as root@<node>"
+            ;;
+        2)
+            SSH_SUDO=true
+            local default_user
+            default_user=$(whoami)
+            prompt_input "SSH username" "$default_user"
+            SSH_USER="$REPLY"
+            log_info "Will connect as ${SSH_USER}@<node> and use sudo"
+            echo
+            log_warn "Ensure ${SSH_USER} has passwordless sudo on all nodes."
+            log_info "Test with: ssh ${SSH_USER}@<node> 'sudo whoami'"
+            ;;
+    esac
+}
+
+# Run a command locally, using sudo if not root.
+# Usage: local_sudo command [args...]
+local_sudo() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+# Read a file locally, using sudo if needed.
+# Usage: local_read_file "/etc/munge/munge.key"
+local_read_file() {
+    local file="$1"
+    if [[ -r "$file" ]]; then
+        cat "$file"
+    else
+        sudo cat "$file"
+    fi
+}
+
 # Extract simple hostnames from slurm.conf NodeName entries.
 # Skips node ranges like node[01-10] and the local hostname.
 get_remote_nodes() {
@@ -45,12 +98,12 @@ get_remote_nodes() {
     local local_host
     local_host=$(hostname -s)
 
-    if [[ ! -f "$conf_file" ]]; then
-        return 1
-    fi
+    # Read config file (may need sudo)
+    local conf_content
+    conf_content=$(local_read_file "$conf_file" 2>/dev/null) || return 1
 
     local node
-    for node in $(grep -oP '^NodeName=\K[^[:space:]]+' "$conf_file" 2>/dev/null); do
+    for node in $(echo "$conf_content" | grep -oP '^NodeName=\K[^[:space:]]+'); do
         # Skip node ranges (contain brackets)
         if [[ "$node" =~ \[ ]]; then
             continue
@@ -65,36 +118,20 @@ get_remote_nodes() {
 
 # Copy config files to a single remote node.
 # Usage: distribute_to_node "hostname"
+# Uses SSH_USER and SSH_SUDO globals to determine connection mode.
 distribute_to_node() {
     local node="$1"
     local failed=false
+    local ssh_target="${SSH_USER}@${node}"
 
     log_info "Distributing to ${node}..."
 
-    # Copy munge key
-    if ! scp -q -o BatchMode=yes /etc/munge/munge.key "root@${node}:/etc/munge/munge.key" 2>/dev/null; then
-        log_error "  Failed to copy munge.key to ${node}"
-        failed=true
-    fi
-
-    # Set munge key permissions
-    if ! ssh -q -o BatchMode=yes "root@${node}" 'chown munge:munge /etc/munge/munge.key && chmod 0400 /etc/munge/munge.key' 2>/dev/null; then
-        log_error "  Failed to set munge.key permissions on ${node}"
-        failed=true
-    fi
-
-    # Copy slurm.conf
-    if ! scp -q -o BatchMode=yes /etc/slurm/slurm.conf "root@${node}:/etc/slurm/slurm.conf" 2>/dev/null; then
-        log_error "  Failed to copy slurm.conf to ${node}"
-        failed=true
-    fi
-
-    # Copy cgroup.conf if it exists
-    if [[ -f /etc/slurm/cgroup.conf ]]; then
-        if ! scp -q -o BatchMode=yes /etc/slurm/cgroup.conf "root@${node}:/etc/slurm/cgroup.conf" 2>/dev/null; then
-            log_error "  Failed to copy cgroup.conf to ${node}"
-            failed=true
-        fi
+    if $SSH_SUDO; then
+        # Sudo mode: copy to temp location, then sudo mv to final destination
+        distribute_to_node_sudo "$node" || failed=true
+    else
+        # Root mode: direct copy to final destination
+        distribute_to_node_root "$node" || failed=true
     fi
 
     if $failed; then
@@ -105,21 +142,184 @@ distribute_to_node() {
     return 0
 }
 
+# Distribute files using direct root SSH (original method).
+# If running locally as non-root, uses sudo to read files first.
+distribute_to_node_root() {
+    local node="$1"
+    local ssh_target="root@${node}"
+    local failed=false
+
+    # If running as non-root locally, we need to stage files first
+    if [[ $EUID -ne 0 ]]; then
+        local local_tmp
+        local_tmp=$(mktemp -d)
+        trap "rm -rf '$local_tmp'" RETURN
+
+        local_read_file /etc/munge/munge.key > "${local_tmp}/munge.key" || {
+            log_error "  Failed to read local munge.key"
+            return 1
+        }
+        local_read_file /etc/slurm/slurm.conf > "${local_tmp}/slurm.conf" || {
+            log_error "  Failed to read local slurm.conf"
+            return 1
+        }
+        if local_sudo test -f /etc/slurm/cgroup.conf 2>/dev/null; then
+            local_read_file /etc/slurm/cgroup.conf > "${local_tmp}/cgroup.conf"
+        fi
+
+        # Copy from temp files
+        if ! scp -q -o BatchMode=yes "${local_tmp}/munge.key" "${ssh_target}:/etc/munge/munge.key" 2>/dev/null; then
+            log_error "  Failed to copy munge.key to ${node}"
+            failed=true
+        fi
+        if ! scp -q -o BatchMode=yes "${local_tmp}/slurm.conf" "${ssh_target}:/etc/slurm/slurm.conf" 2>/dev/null; then
+            log_error "  Failed to copy slurm.conf to ${node}"
+            failed=true
+        fi
+        if [[ -f "${local_tmp}/cgroup.conf" ]]; then
+            if ! scp -q -o BatchMode=yes "${local_tmp}/cgroup.conf" "${ssh_target}:/etc/slurm/cgroup.conf" 2>/dev/null; then
+                log_error "  Failed to copy cgroup.conf to ${node}"
+                failed=true
+            fi
+        fi
+    else
+        # Running as root locally - direct copy
+        if ! scp -q -o BatchMode=yes /etc/munge/munge.key "${ssh_target}:/etc/munge/munge.key" 2>/dev/null; then
+            log_error "  Failed to copy munge.key to ${node}"
+            failed=true
+        fi
+        if ! scp -q -o BatchMode=yes /etc/slurm/slurm.conf "${ssh_target}:/etc/slurm/slurm.conf" 2>/dev/null; then
+            log_error "  Failed to copy slurm.conf to ${node}"
+            failed=true
+        fi
+        if [[ -f /etc/slurm/cgroup.conf ]]; then
+            if ! scp -q -o BatchMode=yes /etc/slurm/cgroup.conf "${ssh_target}:/etc/slurm/cgroup.conf" 2>/dev/null; then
+                log_error "  Failed to copy cgroup.conf to ${node}"
+                failed=true
+            fi
+        fi
+    fi
+
+    # Set munge key permissions (always needed)
+    if ! ssh -q -o BatchMode=yes "$ssh_target" 'chown munge:munge /etc/munge/munge.key && chmod 0400 /etc/munge/munge.key' 2>/dev/null; then
+        log_error "  Failed to set munge.key permissions on ${node}"
+        failed=true
+    fi
+
+    $failed && return 1
+    return 0
+}
+
+# Distribute files using regular user SSH + sudo.
+distribute_to_node_sudo() {
+    local node="$1"
+    local ssh_target="${SSH_USER}@${node}"
+    local failed=false
+    local tmp_dir="/tmp/slurm-dist.$$"
+
+    # Create local temp dir for files we may need to read with sudo
+    local local_tmp
+    local_tmp=$(mktemp -d)
+    trap "rm -rf '$local_tmp'" RETURN
+
+    # Read files locally (may need sudo)
+    local_read_file /etc/munge/munge.key > "${local_tmp}/munge.key" || {
+        log_error "  Failed to read local munge.key"
+        return 1
+    }
+    local_read_file /etc/slurm/slurm.conf > "${local_tmp}/slurm.conf" || {
+        log_error "  Failed to read local slurm.conf"
+        return 1
+    }
+    # Check for cgroup.conf (may need sudo to test existence)
+    if local_sudo test -f /etc/slurm/cgroup.conf 2>/dev/null; then
+        local_read_file /etc/slurm/cgroup.conf > "${local_tmp}/cgroup.conf" || {
+            log_error "  Failed to read local cgroup.conf"
+            return 1
+        }
+    fi
+
+    # Create temp directory on remote
+    if ! ssh -q -o BatchMode=yes "$ssh_target" "mkdir -p ${tmp_dir}" 2>/dev/null; then
+        log_error "  Failed to create temp directory on ${node}"
+        return 1
+    fi
+
+    # Copy files to temp location on remote
+    if ! scp -q -o BatchMode=yes "${local_tmp}/munge.key" "${ssh_target}:${tmp_dir}/munge.key" 2>/dev/null; then
+        log_error "  Failed to copy munge.key to ${node}"
+        failed=true
+    fi
+
+    if ! scp -q -o BatchMode=yes "${local_tmp}/slurm.conf" "${ssh_target}:${tmp_dir}/slurm.conf" 2>/dev/null; then
+        log_error "  Failed to copy slurm.conf to ${node}"
+        failed=true
+    fi
+
+    if [[ -f "${local_tmp}/cgroup.conf" ]]; then
+        if ! scp -q -o BatchMode=yes "${local_tmp}/cgroup.conf" "${ssh_target}:${tmp_dir}/cgroup.conf" 2>/dev/null; then
+            log_error "  Failed to copy cgroup.conf to ${node}"
+            failed=true
+        fi
+    fi
+
+    # Use sudo to move files to final locations and set permissions
+    local remote_script="
+        set -e
+        sudo mv '${tmp_dir}/munge.key' /etc/munge/munge.key
+        sudo chown munge:munge /etc/munge/munge.key
+        sudo chmod 0400 /etc/munge/munge.key
+        sudo mv '${tmp_dir}/slurm.conf' /etc/slurm/slurm.conf
+        sudo chown root:slurm /etc/slurm/slurm.conf 2>/dev/null || sudo chown root:root /etc/slurm/slurm.conf
+        sudo chmod 0644 /etc/slurm/slurm.conf
+        if [[ -f '${tmp_dir}/cgroup.conf' ]]; then
+            sudo mv '${tmp_dir}/cgroup.conf' /etc/slurm/cgroup.conf
+            sudo chown root:slurm /etc/slurm/cgroup.conf 2>/dev/null || sudo chown root:root /etc/slurm/cgroup.conf
+            sudo chmod 0644 /etc/slurm/cgroup.conf
+        fi
+        rm -rf '${tmp_dir}'
+    "
+
+    if ! ssh -q -o BatchMode=yes "$ssh_target" "$remote_script" 2>/dev/null; then
+        log_error "  Failed to install files on ${node} (sudo may have failed)"
+        failed=true
+        # Try to clean up temp dir
+        ssh -q -o BatchMode=yes "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
+    fi
+
+    $failed && return 1
+    return 0
+}
+
 # Main entry point for --setup-nodes
 setup_remote_nodes() {
     show_banner
-    require_root
 
     log_step "Distribute configuration to cluster nodes"
 
-    # Check prerequisites
-    if [[ ! -f /etc/slurm/slurm.conf ]]; then
-        die "slurm.conf not found. Run the installer first to set up the controller."
+    # Check prerequisites - use sudo to test file existence if not root
+    local slurm_conf="/etc/slurm/slurm.conf"
+    local munge_key="/etc/munge/munge.key"
+
+    if [[ $EUID -ne 0 ]]; then
+        log_info "Running as non-root user. Will use sudo to read config files."
+        if ! sudo test -f "$slurm_conf"; then
+            die "slurm.conf not found. Run the installer first to set up the controller."
+        fi
+        if ! sudo test -f "$munge_key"; then
+            die "munge.key not found. Run the installer first to set up the controller."
+        fi
+    else
+        if [[ ! -f "$slurm_conf" ]]; then
+            die "slurm.conf not found. Run the installer first to set up the controller."
+        fi
+        if [[ ! -f "$munge_key" ]]; then
+            die "munge.key not found. Run the installer first to set up the controller."
+        fi
     fi
 
-    if [[ ! -f /etc/munge/munge.key ]]; then
-        die "munge.key not found. Run the installer first to set up the controller."
-    fi
+    # Select SSH connection mode
+    select_ssh_mode
 
     # Get list of remote nodes
     local nodes
@@ -138,8 +338,14 @@ setup_remote_nodes() {
     done
     echo
 
-    log_warn "This requires SSH key-based authentication to each node as root."
+    if $SSH_SUDO; then
+        log_info "Will SSH as ${SSH_USER}@<node> and use sudo for privileged operations."
+    else
+        log_info "Will SSH as root@<node> directly."
+    fi
+    log_warn "Ensure SSH key-based authentication is configured."
     echo
+
     if ! confirm "Proceed with distribution?" "default_yes"; then
         log_info "Cancelled."
         exit 0
@@ -167,7 +373,7 @@ setup_remote_nodes() {
     # Reconfigure slurmctld to pick up any changes
     echo
     log_info "Running scontrol reconfigure..."
-    if scontrol reconfigure 2>/dev/null; then
+    if local_sudo scontrol reconfigure 2>/dev/null; then
         log_success "Controller reconfigured."
     else
         log_warn "scontrol reconfigure failed — controller may not be running."
@@ -176,7 +382,7 @@ setup_remote_nodes() {
     # Show cluster status
     echo
     log_info "Cluster status:"
-    sinfo 2>/dev/null || log_warn "Could not retrieve cluster status."
+    local_sudo sinfo 2>/dev/null || log_warn "Could not retrieve cluster status."
 }
 
 # ── Signal trap for partial state recovery ────────────────────────────────
