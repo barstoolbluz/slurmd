@@ -2,7 +2,7 @@
 # ===========================================================================
 # install.sh — Interactive Slurm installer for Debian systems
 # ===========================================================================
-# Usage: sudo ./install.sh
+# Usage: sudo ./install.sh [--setup-nodes]
 #
 # This script walks you through installing and configuring Slurm on a
 # Debian node. It supports the following node roles:
@@ -12,6 +12,10 @@
 #   3) Database only          — Dedicated accounting DB node
 #   4) Compute node           — Worker that executes jobs
 #   5) Login node             — User-facing, client tools only
+#
+# Options:
+#   --setup-nodes    After controller setup, distribute config files to
+#                    compute/login nodes via SSH (requires key-based auth)
 #
 # Requires: Debian 11+, root privileges, network access to apt repos.
 # ===========================================================================
@@ -31,6 +35,149 @@ source "${SCRIPT_DIR}/lib/database.sh"
 source "${SCRIPT_DIR}/lib/controller.sh"
 source "${SCRIPT_DIR}/lib/compute.sh"
 source "${SCRIPT_DIR}/lib/login.sh"
+
+# ── Distribute configs to remote nodes ────────────────────────────────────
+
+# Extract simple hostnames from slurm.conf NodeName entries.
+# Skips node ranges like node[01-10] and the local hostname.
+get_remote_nodes() {
+    local conf_file="/etc/slurm/slurm.conf"
+    local local_host
+    local_host=$(hostname -s)
+
+    if [[ ! -f "$conf_file" ]]; then
+        return 1
+    fi
+
+    local node
+    for node in $(grep -oP '^NodeName=\K[^[:space:]]+' "$conf_file" 2>/dev/null); do
+        # Skip node ranges (contain brackets)
+        if [[ "$node" =~ \[ ]]; then
+            continue
+        fi
+        # Skip local host
+        if [[ "$node" == "$local_host" ]]; then
+            continue
+        fi
+        echo "$node"
+    done
+}
+
+# Copy config files to a single remote node.
+# Usage: distribute_to_node "hostname"
+distribute_to_node() {
+    local node="$1"
+    local failed=false
+
+    log_info "Distributing to ${node}..."
+
+    # Copy munge key
+    if ! scp -q -o BatchMode=yes /etc/munge/munge.key "root@${node}:/etc/munge/munge.key" 2>/dev/null; then
+        log_error "  Failed to copy munge.key to ${node}"
+        failed=true
+    fi
+
+    # Set munge key permissions
+    if ! ssh -q -o BatchMode=yes "root@${node}" 'chown munge:munge /etc/munge/munge.key && chmod 0400 /etc/munge/munge.key' 2>/dev/null; then
+        log_error "  Failed to set munge.key permissions on ${node}"
+        failed=true
+    fi
+
+    # Copy slurm.conf
+    if ! scp -q -o BatchMode=yes /etc/slurm/slurm.conf "root@${node}:/etc/slurm/slurm.conf" 2>/dev/null; then
+        log_error "  Failed to copy slurm.conf to ${node}"
+        failed=true
+    fi
+
+    # Copy cgroup.conf if it exists
+    if [[ -f /etc/slurm/cgroup.conf ]]; then
+        if ! scp -q -o BatchMode=yes /etc/slurm/cgroup.conf "root@${node}:/etc/slurm/cgroup.conf" 2>/dev/null; then
+            log_error "  Failed to copy cgroup.conf to ${node}"
+            failed=true
+        fi
+    fi
+
+    if $failed; then
+        return 1
+    fi
+
+    log_success "  ${node} — done"
+    return 0
+}
+
+# Main entry point for --setup-nodes
+setup_remote_nodes() {
+    show_banner
+    require_root
+
+    log_step "Distribute configuration to cluster nodes"
+
+    # Check prerequisites
+    if [[ ! -f /etc/slurm/slurm.conf ]]; then
+        die "slurm.conf not found. Run the installer first to set up the controller."
+    fi
+
+    if [[ ! -f /etc/munge/munge.key ]]; then
+        die "munge.key not found. Run the installer first to set up the controller."
+    fi
+
+    # Get list of remote nodes
+    local nodes
+    nodes=$(get_remote_nodes)
+
+    if [[ -z "$nodes" ]]; then
+        log_warn "No remote nodes found in slurm.conf."
+        log_info "Node ranges (e.g., node[01-10]) must be distributed manually."
+        exit 0
+    fi
+
+    echo
+    log_info "Nodes to configure:"
+    echo "$nodes" | while read -r node; do
+        echo -e "  - ${node}"
+    done
+    echo
+
+    log_warn "This requires SSH key-based authentication to each node as root."
+    echo
+    if ! confirm "Proceed with distribution?" "default_yes"; then
+        log_info "Cancelled."
+        exit 0
+    fi
+
+    echo
+    local success_count=0
+    local fail_count=0
+
+    while read -r node; do
+        if distribute_to_node "$node"; then
+            ((success_count++)) || true
+        else
+            ((fail_count++)) || true
+        fi
+    done <<< "$nodes"
+
+    echo
+    if [[ $fail_count -eq 0 ]]; then
+        log_success "All nodes configured successfully."
+    else
+        log_warn "Completed with errors: ${success_count} succeeded, ${fail_count} failed."
+    fi
+
+    # Reconfigure slurmctld to pick up any changes
+    echo
+    log_info "Running scontrol reconfigure..."
+    if scontrol reconfigure 2>/dev/null; then
+        log_success "Controller reconfigured."
+    else
+        log_warn "scontrol reconfigure failed — controller may not be running."
+    fi
+
+    # Show cluster status
+    echo
+    log_info "Cluster status:"
+    sinfo 2>/dev/null || log_warn "Could not retrieve cluster status."
+}
 
 # ── Signal trap for partial state recovery ────────────────────────────────
 
@@ -464,22 +611,23 @@ show_next_steps() {
 
     case "$NODE_ROLE" in
         controller_db)
-            echo -e "  1. Copy ${CYAN}/etc/munge/munge.key${RESET} to all other cluster nodes"
-            echo -e "  2. Copy ${CYAN}/etc/slurm/slurm.conf${RESET} to all other cluster nodes"
-            echo -e "  3. Copy ${CYAN}/etc/slurm/cgroup.conf${RESET} to all compute nodes"
-            echo -e "  4. Run this installer on each compute/login node"
-            echo -e "  5. On each compute node, run ${CYAN}slurmd -C${RESET} and add the output to slurm.conf"
-            echo -e "  6. After adding nodes, run ${CYAN}scontrol reconfigure${RESET} on the controller"
-            echo -e "  7. Verify with ${CYAN}sinfo${RESET} — all nodes should show as 'idle'"
-            echo -e "  8. Create accounts: ${CYAN}sacctmgr add account myaccount${RESET}"
-            echo -e "  9. Add users: ${CYAN}sacctmgr add user myuser account=myaccount${RESET}"
+            echo -e "  1. Run this installer on each compute/login node"
+            echo -e "  2. Distribute configs to nodes (choose one):"
+            echo -e "       ${CYAN}./install.sh --setup-nodes${RESET}  (automatic, requires SSH keys)"
+            echo -e "       Or manually copy munge.key, slurm.conf, cgroup.conf"
+            echo -e "  3. On each compute node, run ${CYAN}slurmd -C${RESET} and add the output to slurm.conf"
+            echo -e "  4. After adding nodes, run ${CYAN}scontrol reconfigure${RESET} on the controller"
+            echo -e "  5. Verify with ${CYAN}sinfo${RESET} — all nodes should show as 'idle'"
+            echo -e "  6. Create accounts: ${CYAN}sacctmgr add account myaccount${RESET}"
+            echo -e "  7. Add users: ${CYAN}sacctmgr add user myuser account=myaccount${RESET}"
             ;;
         controller)
-            echo -e "  1. Copy ${CYAN}/etc/munge/munge.key${RESET} to all other cluster nodes"
-            echo -e "  2. Copy ${CYAN}/etc/slurm/slurm.conf${RESET} to all other cluster nodes"
-            echo -e "  3. Run this installer on the database node first, then compute/login nodes"
-            echo -e "  4. On each compute node, run ${CYAN}slurmd -C${RESET} and add the output to slurm.conf"
-            echo -e "  5. After adding nodes, run ${CYAN}scontrol reconfigure${RESET}"
+            echo -e "  1. Run this installer on the database node first, then compute/login nodes"
+            echo -e "  2. Distribute configs to nodes (choose one):"
+            echo -e "       ${CYAN}./install.sh --setup-nodes${RESET}  (automatic, requires SSH keys)"
+            echo -e "       Or manually copy munge.key, slurm.conf, cgroup.conf"
+            echo -e "  3. On each compute node, run ${CYAN}slurmd -C${RESET} and add the output to slurm.conf"
+            echo -e "  4. After adding nodes, run ${CYAN}scontrol reconfigure${RESET}"
             ;;
         database)
             echo -e "  1. Ensure the controller is configured with:"
@@ -531,4 +679,28 @@ main() {
     log_success "Slurm installation complete for role: ${NODE_ROLE}"
 }
 
-main "$@"
+# ── Argument parsing ──────────────────────────────────────────────────────
+
+case "${1:-}" in
+    --setup-nodes)
+        setup_remote_nodes
+        ;;
+    --help|-h)
+        echo "Usage: $0 [--setup-nodes]"
+        echo
+        echo "Options:"
+        echo "  --setup-nodes    Distribute config files to cluster nodes via SSH"
+        echo "  --help           Show this help message"
+        echo
+        echo "Run without arguments for interactive installation."
+        exit 0
+        ;;
+    "")
+        main "$@"
+        ;;
+    *)
+        echo "Unknown option: $1" >&2
+        echo "Run '$0 --help' for usage." >&2
+        exit 1
+        ;;
+esac
