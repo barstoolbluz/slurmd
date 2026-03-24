@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+# ===========================================================================
+# install.sh — Interactive Slurm installer for Debian systems
+# ===========================================================================
+# Usage: sudo ./install.sh
+#
+# This script walks you through installing and configuring Slurm on a
+# Debian node. It supports the following node roles:
+#
+#   1) Controller + Database  — All-in-one head node (small clusters)
+#   2) Controller only        — Separate head node (DB elsewhere)
+#   3) Database only          — Dedicated accounting DB node
+#   4) Compute node           — Worker that executes jobs
+#   5) Login node             — User-facing, client tools only
+#
+# Requires: Debian 11+, root privileges, network access to apt repos.
+# ===========================================================================
+
+set -euo pipefail
+umask 0077
+
+# Resolve the directory this script lives in (for finding lib/ and config/)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Load library scripts ──────────────────────────────────────────────────
+
+source "${SCRIPT_DIR}/lib/common.sh"
+source "${SCRIPT_DIR}/lib/prereqs.sh"
+source "${SCRIPT_DIR}/lib/munge.sh"
+source "${SCRIPT_DIR}/lib/database.sh"
+source "${SCRIPT_DIR}/lib/controller.sh"
+source "${SCRIPT_DIR}/lib/compute.sh"
+source "${SCRIPT_DIR}/lib/login.sh"
+
+# ── Signal trap for partial state recovery ────────────────────────────────
+
+INSTALL_PROGRESS=""
+
+cleanup() {
+    echo
+    log_error "Installation interrupted!"
+    if [[ -n "$INSTALL_PROGRESS" ]]; then
+        log_info "Completed steps before interruption: ${INSTALL_PROGRESS}"
+    else
+        log_info "No installation steps were completed."
+    fi
+    log_info "You may need to re-run the installer to complete setup."
+    exit 1
+}
+
+trap cleanup INT TERM
+
+# ── Banner ────────────────────────────────────────────────────────────────
+
+show_banner() {
+    echo -e "${BOLD}${CYAN}"
+    cat <<'BANNER'
+  ____  _                        ___           _        _ _
+ / ___|| |_   _ _ __ _ __ ___   |_ _|_ __  ___| |_ __ _| | | ___ _ __
+ \___ \| | | | | '__| '_ ` _ \   | || '_ \/ __| __/ _` | | |/ _ \ '__|
+  ___) | | |_| | |  | | | | | |  | || | | \__ \ || (_| | | |  __/ |
+ |____/|_|\__,_|_|  |_| |_| |_| |___|_| |_|___/\__\__,_|_|_|\___|_|
+
+BANNER
+    echo -e "${RESET}"
+    echo -e "  Interactive Slurm installer for Debian systems"
+    echo -e "  $(date '+%Y-%m-%d %H:%M:%S')"
+    echo
+}
+
+# ── Role selection ────────────────────────────────────────────────────────
+
+select_role() {
+    menu_select "What role should this node serve?" \
+        "Controller + Database  — All-in-one head node (recommended for small clusters)" \
+        "Controller only        — Head node without local database" \
+        "Database only          — Dedicated Slurm accounting database" \
+        "Compute node           — Worker that executes jobs" \
+        "Login node             — User-facing node (submit jobs, no daemons)"
+
+    case "$REPLY" in
+        1) NODE_ROLE="controller_db" ;;
+        2) NODE_ROLE="controller" ;;
+        3) NODE_ROLE="database" ;;
+        4) NODE_ROLE="compute" ;;
+        5) NODE_ROLE="login" ;;
+    esac
+
+    log_info "Selected role: ${NODE_ROLE}"
+}
+
+# ── Gather configuration ─────────────────────────────────────────────────
+
+gather_config() {
+    log_step "Cluster configuration"
+
+    # Cluster name (needed by all roles)
+    prompt_input "Cluster name" "mycluster"
+    CLUSTER_NAME="$REPLY"
+
+    # Controller hostname (needed by all roles)
+    local default_hostname
+    default_hostname="$(hostname -f 2>/dev/null || hostname)"
+
+    case "$NODE_ROLE" in
+        controller|controller_db)
+            prompt_input "Controller hostname (this node)" "$default_hostname"
+            ;;
+        *)
+            prompt_input "Controller hostname (the head node's FQDN or IP)"
+            ;;
+    esac
+    CONTROLLER_HOSTNAME="$REPLY"
+
+    if ! is_valid_hostname "$CONTROLLER_HOSTNAME" && ! is_valid_ip "$CONTROLLER_HOSTNAME"; then
+        log_warn "'${CONTROLLER_HOSTNAME}' doesn't look like a valid hostname or IP."
+        if ! confirm "Continue anyway?" "default_no"; then
+            exit 1
+        fi
+    fi
+
+    # Database hostname
+    case "$NODE_ROLE" in
+        controller_db)
+            DBD_HOSTNAME="$CONTROLLER_HOSTNAME"
+            ;;
+        controller)
+            if confirm "Will this cluster use an accounting database (slurmdbd)?" "default_yes"; then
+                prompt_input "Database node hostname"
+                DBD_HOSTNAME="$REPLY"
+            fi
+            ;;
+        database)
+            prompt_input "Database node hostname (this node)" "$default_hostname"
+            DBD_HOSTNAME="$REPLY"
+            ;;
+        compute|login)
+            if confirm "Does this cluster use an accounting database?" "default_yes"; then
+                prompt_input "Database node hostname"
+                DBD_HOSTNAME="$REPLY"
+            fi
+            ;;
+    esac
+
+    # Database credentials (only for roles that set up MariaDB)
+    case "$NODE_ROLE" in
+        controller_db|database)
+            SLURM_DB_NAME="slurm_acct_db"
+            SLURM_DB_USER="slurm"
+
+            local generated_pass
+            generated_pass="$(openssl rand -base64 16 2>/dev/null)" || die "Failed to generate random password. Ensure openssl is installed."
+            prompt_password "MariaDB password for the 'slurm' user" "$generated_pass"
+            SLURM_DB_PASS="$REPLY"
+
+            if [[ "$SLURM_DB_PASS" == "$generated_pass" ]]; then
+                log_info "Auto-generated password will be stored in /etc/slurm/slurmdbd.conf"
+            fi
+            ;;
+    esac
+
+    # UID/GID for slurm user (consistency across cluster is critical)
+    echo
+    log_info "The 'slurm' user UID/GID must be identical across all cluster nodes."
+    if confirm "Use default UID/GID 64030?" "default_yes"; then
+        SLURM_UID=64030
+        SLURM_GID=64030
+    else
+        prompt_input "Slurm user UID"
+        SLURM_UID="$REPLY"
+        [[ "$SLURM_UID" =~ ^[0-9]+$ ]] && (( SLURM_UID > 0 )) || die "Invalid UID: must be a positive integer"
+        prompt_input "Slurm group GID"
+        SLURM_GID="$REPLY"
+        [[ "$SLURM_GID" =~ ^[0-9]+$ ]] && (( SLURM_GID > 0 )) || die "Invalid GID: must be a positive integer"
+    fi
+
+    # Compute node definitions (controller roles only)
+    case "$NODE_ROLE" in
+        controller|controller_db)
+            echo
+            log_info "You can define compute nodes now, or add them later."
+            log_info "On each compute node, run 'slurmd -C' to get the hardware line."
+            echo
+            if confirm "Define compute nodes now?" "default_no"; then
+                gather_compute_nodes
+            else
+                COMPUTE_NODES=""
+            fi
+
+            prompt_input "Default partition name" "batch"
+            PARTITION_NAME="$REPLY"
+            ;;
+    esac
+}
+
+gather_compute_nodes() {
+    COMPUTE_NODES=""
+    echo
+    echo -e "Enter compute node definitions one per line."
+    echo -e "Format: ${CYAN}NodeName=<name> CPUs=<n> RealMemory=<MB> State=UNKNOWN${RESET}"
+    echo -e "Or a shorter form: ${CYAN}<hostname> <cpus> <memory_mb>${RESET}"
+    echo -e "Enter an empty line when done."
+    echo
+
+    while true; do
+        read -rp "Node> " line
+        if [[ -z "$line" ]]; then
+            break
+        fi
+
+        # If the user entered the short form: "hostname cpus memory"
+        if [[ "$line" =~ ^([]a-zA-Z0-9_[.-]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+            local name="${BASH_REMATCH[1]}"
+            local cpus="${BASH_REMATCH[2]}"
+            local mem="${BASH_REMATCH[3]}"
+            line="NodeName=${name} CPUs=${cpus} RealMemory=${mem} State=UNKNOWN"
+            log_info "Expanded to: ${line}"
+        fi
+
+        if [[ -n "$COMPUTE_NODES" ]]; then
+            COMPUTE_NODES="${COMPUTE_NODES}"$'\n'"${line}"
+        else
+            COMPUTE_NODES="$line"
+        fi
+    done
+}
+
+# ── Summary and confirmation ──────────────────────────────────────────────
+
+show_summary() {
+    local lines=()
+    lines+=("${BOLD}Role:${RESET}              ${NODE_ROLE}")
+    lines+=("${BOLD}Cluster:${RESET}           ${CLUSTER_NAME}")
+    lines+=("${BOLD}Controller:${RESET}        ${CONTROLLER_HOSTNAME}")
+    lines+=("${BOLD}Slurm UID/GID:${RESET}     ${SLURM_UID}/${SLURM_GID}")
+
+    if [[ -n "${DBD_HOSTNAME:-}" ]]; then
+        lines+=("${BOLD}Database host:${RESET}     ${DBD_HOSTNAME}")
+    fi
+
+    case "$NODE_ROLE" in
+        controller_db|database)
+            lines+=("${BOLD}DB name:${RESET}           ${SLURM_DB_NAME}")
+            lines+=("${BOLD}DB user:${RESET}           ${SLURM_DB_USER}")
+            ;;
+    esac
+
+    echo
+    lines+=("")
+    lines+=("${BOLD}What will be installed:${RESET}")
+
+    case "$NODE_ROLE" in
+        controller_db)
+            lines+=("  - MUNGE (auth, key generation)")
+            lines+=("  - MariaDB + slurmdbd (accounting)")
+            lines+=("  - slurmctld (controller)")
+            lines+=("  - slurm-client (CLI tools)")
+            ;;
+        controller)
+            lines+=("  - MUNGE (auth, key generation)")
+            lines+=("  - slurmctld (controller)")
+            lines+=("  - slurm-client (CLI tools)")
+            ;;
+        database)
+            lines+=("  - MUNGE (auth, key import)")
+            lines+=("  - MariaDB + slurmdbd (accounting)")
+            ;;
+        compute)
+            lines+=("  - MUNGE (auth, key import)")
+            lines+=("  - slurmd (compute daemon)")
+            lines+=("  - slurm-client (CLI tools)")
+            ;;
+        login)
+            lines+=("  - MUNGE (auth, key import)")
+            lines+=("  - slurm-client (CLI tools)")
+            ;;
+    esac
+
+    print_summary "Installation Summary" "${lines[@]}"
+}
+
+# ── Installation orchestration ────────────────────────────────────────────
+
+run_install() {
+    # Determine MUNGE mode: controller/controller_db generate the key, others import
+    local munge_mode="import"
+    case "$NODE_ROLE" in
+        controller|controller_db) munge_mode="generate" ;;
+    esac
+
+    # Step 1: Prerequisites (all roles)
+    log_step "Step 1/4: System prerequisites"
+    install_prereqs
+    INSTALL_PROGRESS="prerequisites"
+
+    # Step 2: MUNGE (all roles)
+    log_step "Step 2/4: MUNGE authentication"
+    setup_munge "$munge_mode"
+    INSTALL_PROGRESS="prerequisites, munge"
+
+    # Step 3: Role-specific setup
+    log_step "Step 3/4: Role-specific installation (${NODE_ROLE})"
+    case "$NODE_ROLE" in
+        controller_db)
+            setup_database
+            setup_controller
+            ;;
+        controller)
+            setup_controller
+            ;;
+        database)
+            setup_database
+            ;;
+        compute)
+            setup_compute
+            ;;
+        login)
+            setup_login
+            ;;
+    esac
+    INSTALL_PROGRESS="prerequisites, munge, ${NODE_ROLE} setup"
+
+    # Step 4: Verification
+    log_step "Step 4/4: Verification"
+    verify_install
+}
+
+# ── Post-install verification ─────────────────────────────────────────────
+
+verify_install() {
+    local ok=true
+
+    # Check MUNGE
+    if is_service_active munge; then
+        log_success "munge.service is running."
+    else
+        log_error "munge.service is NOT running."
+        ok=false
+    fi
+
+    # Check role-specific services
+    case "$NODE_ROLE" in
+        controller_db)
+            for svc in mariadb slurmdbd slurmctld; do
+                if is_service_active "$svc"; then
+                    log_success "${svc}.service is running."
+                else
+                    log_error "${svc}.service is NOT running."
+                    ok=false
+                fi
+            done
+            ;;
+        controller)
+            if is_service_active slurmctld; then
+                log_success "slurmctld.service is running."
+            else
+                log_error "slurmctld.service is NOT running."
+                ok=false
+            fi
+            ;;
+        database)
+            for svc in mariadb slurmdbd; do
+                if is_service_active "$svc"; then
+                    log_success "${svc}.service is running."
+                else
+                    log_error "${svc}.service is NOT running."
+                    ok=false
+                fi
+            done
+            ;;
+        compute)
+            if is_service_active slurmd; then
+                log_success "slurmd.service is running."
+            else
+                log_error "slurmd.service is NOT running."
+                ok=false
+            fi
+            ;;
+        login)
+            log_info "Login node has no Slurm daemons to verify."
+            ;;
+    esac
+
+    # Check config files (slurmdbd-only nodes don't need slurm.conf)
+    if [[ "$NODE_ROLE" != "database" ]]; then
+        if [[ -f /etc/slurm/slurm.conf ]]; then
+            log_success "slurm.conf exists."
+        else
+            log_warn "slurm.conf not found at /etc/slurm/slurm.conf."
+        fi
+    fi
+
+    if [[ "$NODE_ROLE" == "controller_db" || "$NODE_ROLE" == "database" ]]; then
+        if [[ -f /etc/slurm/slurmdbd.conf ]]; then
+            log_success "slurmdbd.conf exists (mode $(stat -c %a /etc/slurm/slurmdbd.conf))."
+        else
+            log_warn "slurmdbd.conf not found."
+        fi
+    fi
+
+    echo
+    if $ok; then
+        log_success "All checks passed!"
+    else
+        log_warn "Some checks failed. Review the output above."
+    fi
+}
+
+# ── Post-install next steps ───────────────────────────────────────────────
+
+show_next_steps() {
+    echo
+    log_step "Next steps"
+
+    case "$NODE_ROLE" in
+        controller_db)
+            echo -e "  1. Copy ${CYAN}/etc/munge/munge.key${RESET} to all other cluster nodes"
+            echo -e "  2. Copy ${CYAN}/etc/slurm/slurm.conf${RESET} to all other cluster nodes"
+            echo -e "  3. Copy ${CYAN}/etc/slurm/cgroup.conf${RESET} to all compute nodes"
+            echo -e "  4. Run this installer on each compute/login node"
+            echo -e "  5. On each compute node, run ${CYAN}slurmd -C${RESET} and add the output to slurm.conf"
+            echo -e "  6. After adding nodes, run ${CYAN}scontrol reconfigure${RESET} on the controller"
+            echo -e "  7. Verify with ${CYAN}sinfo${RESET} — all nodes should show as 'idle'"
+            echo -e "  8. Create accounts: ${CYAN}sacctmgr add account myaccount${RESET}"
+            echo -e "  9. Add users: ${CYAN}sacctmgr add user myuser account=myaccount${RESET}"
+            ;;
+        controller)
+            echo -e "  1. Copy ${CYAN}/etc/munge/munge.key${RESET} to all other cluster nodes"
+            echo -e "  2. Copy ${CYAN}/etc/slurm/slurm.conf${RESET} to all other cluster nodes"
+            echo -e "  3. Run this installer on the database node first, then compute/login nodes"
+            echo -e "  4. On each compute node, run ${CYAN}slurmd -C${RESET} and add the output to slurm.conf"
+            echo -e "  5. After adding nodes, run ${CYAN}scontrol reconfigure${RESET}"
+            ;;
+        database)
+            echo -e "  1. Ensure the controller is configured with:"
+            echo -e "     ${CYAN}AccountingStorageHost=${DBD_HOSTNAME}${RESET}"
+            echo -e "  2. The database password was set during this install."
+            echo -e "     Keep it secure — it's stored in ${CYAN}/etc/slurm/slurmdbd.conf${RESET}."
+            ;;
+        compute)
+            echo -e "  1. Run ${CYAN}slurmd -C${RESET} and send the output to the cluster admin"
+            echo -e "  2. The admin must add the NodeName line to slurm.conf on the controller"
+            echo -e "  3. Then run ${CYAN}scontrol reconfigure${RESET} on the controller"
+            echo -e "  4. Verify this node appears in ${CYAN}sinfo${RESET}"
+            ;;
+        login)
+            echo -e "  1. Verify connectivity: ${CYAN}sinfo${RESET}"
+            echo -e "  2. If sinfo fails, check that slurm.conf matches the controller exactly"
+            echo -e "  3. Users can now submit jobs with ${CYAN}srun${RESET}, ${CYAN}sbatch${RESET}, etc."
+            ;;
+    esac
+
+    echo
+    echo -e "  Useful commands:"
+    echo -e "    ${CYAN}sinfo${RESET}              — show cluster node/partition status"
+    echo -e "    ${CYAN}squeue${RESET}             — show job queue"
+    echo -e "    ${CYAN}scontrol show nodes${RESET} — detailed node info"
+    echo -e "    ${CYAN}sacctmgr show assoc${RESET} — accounting associations"
+    echo
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────
+
+main() {
+    show_banner
+    require_root
+    require_debian
+
+    select_role
+    gather_config
+    show_summary
+
+    if ! confirm "Proceed with installation?" "default_yes"; then
+        log_info "Installation cancelled."
+        exit 0
+    fi
+
+    run_install
+    show_next_steps
+
+    log_success "Slurm installation complete for role: ${NODE_ROLE}"
+}
+
+main "$@"
