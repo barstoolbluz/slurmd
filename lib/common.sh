@@ -186,6 +186,140 @@ is_valid_ip() {
     return 0
 }
 
+# ── Hardware Detection ──────────────────────────────────────────────────────
+
+# Detect local hardware from /proc without requiring slurmd.
+# Sets global variables: LOCAL_HOSTNAME, LOCAL_CPUS, LOCAL_MEMORY_MB,
+#                        LOCAL_SOCKETS, LOCAL_CORES_PER_SOCKET, LOCAL_THREADS_PER_CORE
+# Returns 0 on success, 1 on failure.
+detect_local_hardware() {
+    # Reset globals
+    LOCAL_HOSTNAME=""
+    LOCAL_CPUS=""
+    LOCAL_MEMORY_MB=""
+    LOCAL_SOCKETS=""
+    LOCAL_CORES_PER_SOCKET=""
+    LOCAL_THREADS_PER_CORE=""
+
+    # Check if we're in a container (detection may reflect host hardware)
+    local in_container=false
+    if [[ -f /.dockerenv ]] || grep -qE '(docker|lxc|containerd)' /proc/1/cgroup 2>/dev/null; then
+        in_container=true
+    fi
+
+    # Hostname (short form)
+    LOCAL_HOSTNAME=$(hostname -s 2>/dev/null) || {
+        log_warn "Could not detect hostname"
+        return 1
+    }
+    if [[ -z "$LOCAL_HOSTNAME" ]]; then
+        log_warn "Hostname is empty"
+        return 1
+    fi
+
+    # CPUs (logical processors)
+    if command -v nproc &>/dev/null; then
+        LOCAL_CPUS=$(nproc --all 2>/dev/null)
+    fi
+    if [[ -z "$LOCAL_CPUS" ]] && [[ -f /proc/cpuinfo ]]; then
+        LOCAL_CPUS=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+    fi
+    if [[ -z "$LOCAL_CPUS" || "$LOCAL_CPUS" -lt 1 ]]; then
+        log_warn "Could not detect CPU count"
+        return 1
+    fi
+
+    # Memory (MB)
+    if [[ -f /proc/meminfo ]]; then
+        LOCAL_MEMORY_MB=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)
+    fi
+    if [[ -z "$LOCAL_MEMORY_MB" || "$LOCAL_MEMORY_MB" -lt 1 ]]; then
+        log_warn "Could not detect memory size"
+        return 1
+    fi
+
+    # CPU topology: sockets, cores per socket, threads per core
+    # Default to 1 socket if not detectable (common in VMs)
+    LOCAL_SOCKETS=1
+    LOCAL_CORES_PER_SOCKET="$LOCAL_CPUS"
+    LOCAL_THREADS_PER_CORE=1
+
+    if [[ -f /proc/cpuinfo ]]; then
+        # Count unique physical IDs for socket count
+        local socket_count
+        socket_count=$(grep '^physical id' /proc/cpuinfo 2>/dev/null | sort -u | wc -l)
+        if [[ -n "$socket_count" && "$socket_count" -gt 0 ]]; then
+            LOCAL_SOCKETS="$socket_count"
+        fi
+
+        # Get cores per socket from cpu cores field
+        local cores
+        cores=$(grep -m1 '^cpu cores' /proc/cpuinfo 2>/dev/null | awk '{print $NF}')
+        if [[ -n "$cores" && "$cores" -gt 0 ]]; then
+            LOCAL_CORES_PER_SOCKET="$cores"
+        else
+            # Fallback: divide CPUs by sockets
+            LOCAL_CORES_PER_SOCKET=$(( LOCAL_CPUS / LOCAL_SOCKETS ))
+        fi
+
+        # Calculate threads per core
+        local total_cores=$(( LOCAL_SOCKETS * LOCAL_CORES_PER_SOCKET ))
+        if [[ "$total_cores" -gt 0 ]]; then
+            LOCAL_THREADS_PER_CORE=$(( LOCAL_CPUS / total_cores ))
+        fi
+        # Ensure at least 1 thread per core
+        if [[ "$LOCAL_THREADS_PER_CORE" -lt 1 ]]; then
+            LOCAL_THREADS_PER_CORE=1
+        fi
+    fi
+
+    # Warn if in container
+    if $in_container; then
+        log_warn "Container detected — hardware values may reflect the host system."
+    fi
+
+    return 0
+}
+
+# Generate a complete NodeName line from LOCAL_* variables.
+# Usage: format_nodename_line
+# Output: NodeName=<hostname> CPUs=<n> RealMemory=<MB> Sockets=<n> CoresPerSocket=<n> ThreadsPerCore=<n> State=UNKNOWN
+# Requires: detect_local_hardware() must be called first.
+format_nodename_line() {
+    # Verify all required variables are set
+    if [[ -z "${LOCAL_HOSTNAME:-}" || -z "${LOCAL_CPUS:-}" || -z "${LOCAL_MEMORY_MB:-}" ]]; then
+        echo ""
+        return 1
+    fi
+
+    echo "NodeName=${LOCAL_HOSTNAME} CPUs=${LOCAL_CPUS} RealMemory=${LOCAL_MEMORY_MB} Sockets=${LOCAL_SOCKETS:-1} CoresPerSocket=${LOCAL_CORES_PER_SOCKET:-${LOCAL_CPUS}} ThreadsPerCore=${LOCAL_THREADS_PER_CORE:-1} State=UNKNOWN"
+}
+
+# Display detected hardware in a formatted summary box.
+# Requires: detect_local_hardware() must be called first.
+show_detected_hardware() {
+    if [[ -z "${LOCAL_HOSTNAME:-}" || -z "${LOCAL_CPUS:-}" || -z "${LOCAL_MEMORY_MB:-}" ]]; then
+        log_warn "Hardware detection not run or failed."
+        return 1
+    fi
+
+    local nodename_line
+    nodename_line=$(format_nodename_line)
+
+    local lines=()
+    lines+=("${BOLD}Hostname:${RESET}          ${LOCAL_HOSTNAME}")
+    lines+=("${BOLD}CPUs (logical):${RESET}    ${LOCAL_CPUS}")
+    lines+=("${BOLD}Memory:${RESET}            ${LOCAL_MEMORY_MB} MB")
+    lines+=("${BOLD}Sockets:${RESET}           ${LOCAL_SOCKETS:-1}")
+    lines+=("${BOLD}CoresPerSocket:${RESET}    ${LOCAL_CORES_PER_SOCKET:-${LOCAL_CPUS}}")
+    lines+=("${BOLD}ThreadsPerCore:${RESET}    ${LOCAL_THREADS_PER_CORE:-1}")
+    lines+=("")
+    lines+=("${BOLD}NodeName line:${RESET}")
+    lines+=("  ${CYAN}${nodename_line}${RESET}")
+
+    print_summary "Detected Hardware" "${lines[@]}"
+}
+
 # ── Utility ─────────────────────────────────────────────────────────────────
 
 # Back up a file before modifying it.

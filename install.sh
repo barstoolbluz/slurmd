@@ -195,11 +195,30 @@ gather_config() {
 
 gather_compute_nodes() {
     COMPUTE_NODES=""
+
+    # Auto-detect hardware and offer to add this machine as a compute node
+    if detect_local_hardware; then
+        show_detected_hardware
+
+        echo -e "This is common for small clusters where the controller also runs jobs."
+        if confirm "Add THIS machine (${LOCAL_HOSTNAME}) as a compute node?" "default_no"; then
+            local nodename_line
+            nodename_line=$(format_nodename_line)
+            COMPUTE_NODES="$nodename_line"
+            log_success "Added: ${nodename_line}"
+        fi
+    fi
+
     echo
-    echo -e "Enter compute node definitions one per line."
+    echo -e "Enter additional compute node definitions one per line."
     echo -e "Format: ${CYAN}NodeName=<name> CPUs=<n> RealMemory=<MB> State=UNKNOWN${RESET}"
     echo -e "Or a shorter form: ${CYAN}<hostname> <cpus> <memory_mb>${RESET}"
     echo -e "Enter an empty line when done."
+
+    # Show hint with local machine values if detection succeeded
+    if [[ -n "${LOCAL_CPUS:-}" && -n "${LOCAL_MEMORY_MB:-}" ]]; then
+        echo -e "${YELLOW}Hint:${RESET} This machine has ${LOCAL_CPUS} CPUs and ${LOCAL_MEMORY_MB} MB RAM."
+    fi
     echo
 
     while true; do

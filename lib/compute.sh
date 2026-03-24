@@ -2,6 +2,29 @@
 # compute.sh — slurmd (compute node) setup
 # Sourced by install.sh; requires common.sh to be loaded first.
 
+# Show hardware detection early, before any installation prompts.
+# This gives the user the NodeName line they need to send to the cluster admin.
+show_compute_hardware_early() {
+    log_step "Hardware detection"
+
+    if ! detect_local_hardware; then
+        log_warn "Could not auto-detect hardware. Will retry after slurmd is installed."
+        return 0
+    fi
+
+    show_detected_hardware
+
+    echo -e "  ${BOLD}${YELLOW}IMPORTANT:${RESET} Send the NodeName line above to your cluster administrator."
+    echo -e "  They must add it to slurm.conf on the controller before this node can join."
+    echo
+
+    if ! confirm "Continue with installation?" "default_yes"; then
+        echo
+        echo -e "  Copy the NodeName line above, then re-run this installer when ready."
+        exit 0
+    fi
+}
+
 install_compute_packages() {
     log_step "Installing compute node packages"
 
@@ -119,20 +142,37 @@ setup_cgroup_conf_compute() {
 }
 
 detect_hardware() {
-    log_step "Detecting hardware"
+    log_step "Verifying hardware detection"
 
     echo
-    log_info "Auto-detected hardware for this node:"
-    echo
 
-    # slurmd -C prints a NodeName line with detected hardware
+    # slurmd -C uses hwloc for more accurate detection
     if command -v slurmd &>/dev/null; then
         local hw_line
         if hw_line=$(slurmd -C 2>/dev/null | head -1) && [[ -n "$hw_line" ]]; then
+            log_info "Hardware detected by slurmd (uses hwloc for accuracy):"
+            echo
             echo -e "  ${CYAN}${hw_line}${RESET}"
             echo
-            log_info "Add this line to slurm.conf on the controller node"
-            log_info "(replace the NodeName with this node's hostname)."
+
+            # Compare with earlier /proc-based detection if available
+            if [[ -n "${LOCAL_CPUS:-}" ]]; then
+                # Extract values from slurmd output
+                local slurmd_cpus slurmd_mem
+                slurmd_cpus=$(echo "$hw_line" | grep -oP 'CPUs=\K[0-9]+' || echo "")
+                slurmd_mem=$(echo "$hw_line" | grep -oP 'RealMemory=\K[0-9]+' || echo "")
+
+                if [[ -n "$slurmd_cpus" && "$slurmd_cpus" != "$LOCAL_CPUS" ]]; then
+                    log_info "Note: slurmd detected ${slurmd_cpus} CPUs (earlier estimate: ${LOCAL_CPUS})"
+                    log_info "The slurmd value is typically more accurate."
+                fi
+                if [[ -n "$slurmd_mem" && "$slurmd_mem" != "$LOCAL_MEMORY_MB" ]]; then
+                    log_info "Note: slurmd detected ${slurmd_mem} MB RAM (earlier estimate: ${LOCAL_MEMORY_MB} MB)"
+                    log_info "The slurmd value accounts for reserved memory."
+                fi
+            fi
+
+            echo -e "  ${BOLD}Ensure this NodeName line matches slurm.conf on the controller.${RESET}"
         else
             log_warn "slurmd -C could not detect hardware (config may be incomplete)."
             log_info "After setup is complete, run: slurmd -C"
@@ -152,6 +192,7 @@ start_slurmd() {
 # ── Main entry point ───────────────────────────────────────────────────────
 
 setup_compute() {
+    show_compute_hardware_early
     install_compute_packages
     setup_slurm_conf_compute
     setup_cgroup_conf_compute
