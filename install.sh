@@ -64,8 +64,7 @@ select_ssh_mode() {
             SSH_USER="$REPLY"
             log_info "Will connect as ${SSH_USER}@<node> and use sudo"
             echo
-            log_warn "Ensure ${SSH_USER} has passwordless sudo on all nodes."
-            log_info "Test with: ssh ${SSH_USER}@<node> 'sudo whoami'"
+            log_info "You may be prompted for sudo password on each node."
             ;;
     esac
 }
@@ -114,6 +113,36 @@ get_remote_nodes() {
         fi
         echo "$node"
     done
+}
+
+# Test SSH connectivity to a node and report issues.
+# Usage: test_ssh_connectivity "hostname"
+# Returns 0 if OK, 1 if failed (with helpful error message).
+test_ssh_connectivity() {
+    local node="$1"
+    local ssh_target="${SSH_USER}@${node}"
+    local ssh_err
+
+    if ! ssh_err=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$ssh_target" 'echo ok' 2>&1); then
+        if [[ "$ssh_err" == *"Host key verification"* ]]; then
+            log_error "  ${node}: Host key not accepted"
+            log_info "    Fix: ssh ${ssh_target}  (accept the key, then retry)"
+        elif [[ "$ssh_err" == *"Permission denied"* ]]; then
+            log_error "  ${node}: SSH key authentication failed"
+            log_info "    Fix: ssh-copy-id ${ssh_target}"
+        elif [[ "$ssh_err" == *"Could not resolve"* || "$ssh_err" == *"Name or service not known"* ]]; then
+            log_error "  ${node}: Hostname not found"
+            log_info "    Fix: Add ${node} to /etc/hosts or DNS"
+        elif [[ "$ssh_err" == *"Connection refused"* ]]; then
+            log_error "  ${node}: Connection refused (SSH not running?)"
+        elif [[ "$ssh_err" == *"Connection timed out"* || "$ssh_err" == *"timed out"* ]]; then
+            log_error "  ${node}: Connection timed out (network issue?)"
+        else
+            log_error "  ${node}: SSH failed - ${ssh_err}"
+        fi
+        return 1
+    fi
+    return 0
 }
 
 # Copy config files to a single remote node.
@@ -240,8 +269,16 @@ distribute_to_node_sudo() {
     fi
 
     # Create temp directory on remote
-    if ! ssh -q -o BatchMode=yes "$ssh_target" "mkdir -p ${tmp_dir}" 2>/dev/null; then
-        log_error "  Failed to create temp directory on ${node}"
+    local ssh_err
+    if ! ssh_err=$(ssh -o BatchMode=yes "$ssh_target" "mkdir -p ${tmp_dir}" 2>&1); then
+        log_error "  Failed to connect to ${node}"
+        if [[ "$ssh_err" == *"Host key verification"* ]]; then
+            log_error "  Host key not accepted. Run: ssh ${ssh_target} 'echo connected'"
+        elif [[ "$ssh_err" == *"Permission denied"* ]]; then
+            log_error "  SSH key auth failed. Run: ssh-copy-id ${ssh_target}"
+        else
+            log_error "  SSH error: ${ssh_err}"
+        fi
         return 1
     fi
 
@@ -264,24 +301,29 @@ distribute_to_node_sudo() {
     fi
 
     # Use sudo to move files to final locations and set permissions
-    local remote_script="
-        set -e
-        sudo mv '${tmp_dir}/munge.key' /etc/munge/munge.key
-        sudo chown munge:munge /etc/munge/munge.key
-        sudo chmod 0400 /etc/munge/munge.key
-        sudo mv '${tmp_dir}/slurm.conf' /etc/slurm/slurm.conf
-        sudo chown root:slurm /etc/slurm/slurm.conf 2>/dev/null || sudo chown root:root /etc/slurm/slurm.conf
-        sudo chmod 0644 /etc/slurm/slurm.conf
-        if [[ -f '${tmp_dir}/cgroup.conf' ]]; then
-            sudo mv '${tmp_dir}/cgroup.conf' /etc/slurm/cgroup.conf
-            sudo chown root:slurm /etc/slurm/cgroup.conf 2>/dev/null || sudo chown root:root /etc/slurm/cgroup.conf
-            sudo chmod 0644 /etc/slurm/cgroup.conf
-        fi
-        rm -rf '${tmp_dir}'
-    "
+    # Create a remote script file to avoid quoting issues with ssh -tt
+    local remote_script="${tmp_dir}/install.sh"
 
-    if ! ssh -q -o BatchMode=yes "$ssh_target" "$remote_script" 2>/dev/null; then
-        log_error "  Failed to install files on ${node} (sudo may have failed)"
+    {
+        echo '#!/bin/bash'
+        echo 'set -e'
+        echo "sudo mv ${tmp_dir}/munge.key /etc/munge/munge.key"
+        echo 'sudo chown munge:munge /etc/munge/munge.key'
+        echo 'sudo chmod 0400 /etc/munge/munge.key'
+        echo "sudo mv ${tmp_dir}/slurm.conf /etc/slurm/slurm.conf"
+        echo 'sudo chown root:root /etc/slurm/slurm.conf'
+        echo 'sudo chmod 0644 /etc/slurm/slurm.conf'
+        if [[ -f "${local_tmp}/cgroup.conf" ]]; then
+            echo "sudo mv ${tmp_dir}/cgroup.conf /etc/slurm/cgroup.conf"
+            echo 'sudo chown root:root /etc/slurm/cgroup.conf'
+            echo 'sudo chmod 0644 /etc/slurm/cgroup.conf'
+        fi
+        echo "rm -rf ${tmp_dir}"
+    } | ssh -q -o BatchMode=yes "$ssh_target" "cat > ${remote_script} && chmod +x ${remote_script}"
+
+    log_info "  Installing files (sudo may prompt for password)..."
+    if ! ssh -tt "$ssh_target" "${remote_script}" </dev/tty; then
+        log_error "  Failed to install files on ${node}"
         failed=true
         # Try to clean up temp dir
         ssh -q -o BatchMode=yes "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
@@ -350,6 +392,23 @@ setup_remote_nodes() {
         log_info "Cancelled."
         exit 0
     fi
+
+    # Pre-flight: test SSH connectivity to all nodes
+    echo
+    log_info "Testing SSH connectivity..."
+    local ssh_failures=0
+    while read -r node; do
+        if ! test_ssh_connectivity "$node"; then
+            ((ssh_failures++)) || true
+        fi
+    done <<< "$nodes"
+
+    if [[ $ssh_failures -gt 0 ]]; then
+        echo
+        log_error "SSH connectivity failed for ${ssh_failures} node(s). Fix the issues above and retry."
+        exit 1
+    fi
+    log_success "All nodes reachable."
 
     echo
     local success_count=0
