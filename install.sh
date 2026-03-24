@@ -39,32 +39,42 @@ source "${SCRIPT_DIR}/lib/login.sh"
 # ── Distribute configs to remote nodes ────────────────────────────────────
 
 # SSH connection mode globals
-SSH_USER=""        # Username for SSH (empty = root mode)
-SSH_SUDO=false     # Whether to use sudo on remote
+SSH_USER=""        # Username for SSH
+SSH_MODE=""        # "root" | "sudo_passwordless" | "sudo_password"
+
+# Controller also acting as compute node
+CONTROLLER_IS_COMPUTE=false
 
 # Prompt user to select SSH connection mode.
-# Sets SSH_USER and SSH_SUDO globals.
+# Sets SSH_USER and SSH_MODE globals.
 select_ssh_mode() {
     echo
     menu_select "How do you connect to cluster nodes?" \
         "As root directly (SSH as root@node)" \
-        "As a regular user with sudo (user@node + sudo)"
+        "As a regular user with passwordless sudo (recommended)" \
+        "As a regular user with sudo (password prompt)"
 
     case "$REPLY" in
         1)
             SSH_USER="root"
-            SSH_SUDO=false
+            SSH_MODE="root"
             log_info "Will connect as root@<node>"
             ;;
         2)
-            SSH_SUDO=true
+            SSH_MODE="sudo_passwordless"
             local default_user
             default_user=$(whoami)
             prompt_input "SSH username" "$default_user"
             SSH_USER="$REPLY"
-            log_info "Will connect as ${SSH_USER}@<node> and use sudo"
-            echo
-            log_info "You may be prompted for sudo password on each node."
+            log_info "Will connect as ${SSH_USER}@<node> with passwordless sudo"
+            ;;
+        3)
+            SSH_MODE="sudo_password"
+            local default_user
+            default_user=$(whoami)
+            prompt_input "SSH username" "$default_user"
+            SSH_USER="$REPLY"
+            log_info "Will connect as ${SSH_USER}@<node> with sudo (password prompt)"
             ;;
     esac
 }
@@ -147,21 +157,24 @@ test_ssh_connectivity() {
 
 # Copy config files to a single remote node.
 # Usage: distribute_to_node "hostname"
-# Uses SSH_USER and SSH_SUDO globals to determine connection mode.
+# Uses SSH_USER and SSH_MODE globals to determine connection mode.
 distribute_to_node() {
     local node="$1"
     local failed=false
-    local ssh_target="${SSH_USER}@${node}"
 
     log_info "Distributing to ${node}..."
 
-    if $SSH_SUDO; then
-        # Sudo mode: copy to temp location, then sudo mv to final destination
-        distribute_to_node_sudo "$node" || failed=true
-    else
-        # Root mode: direct copy to final destination
-        distribute_to_node_root "$node" || failed=true
-    fi
+    case "$SSH_MODE" in
+        root)
+            distribute_to_node_root "$node" || failed=true
+            ;;
+        sudo_passwordless)
+            distribute_to_node_sudo_passwordless "$node" || failed=true
+            ;;
+        sudo_password)
+            distribute_to_node_sudo_password "$node" || failed=true
+            ;;
+    esac
 
     if $failed; then
         return 1
@@ -239,8 +252,8 @@ distribute_to_node_root() {
     return 0
 }
 
-# Distribute files using regular user SSH + sudo.
-distribute_to_node_sudo() {
+# Distribute files using regular user SSH + passwordless sudo (BatchMode).
+distribute_to_node_sudo_passwordless() {
     local node="$1"
     local ssh_target="${SSH_USER}@${node}"
     local failed=false
@@ -260,7 +273,6 @@ distribute_to_node_sudo() {
         log_error "  Failed to read local slurm.conf"
         return 1
     }
-    # Check for cgroup.conf (may need sudo to test existence)
     if local_sudo test -f /etc/slurm/cgroup.conf 2>/dev/null; then
         local_read_file /etc/slurm/cgroup.conf > "${local_tmp}/cgroup.conf" || {
             log_error "  Failed to read local cgroup.conf"
@@ -269,16 +281,8 @@ distribute_to_node_sudo() {
     fi
 
     # Create temp directory on remote
-    local ssh_err
-    if ! ssh_err=$(ssh -o BatchMode=yes "$ssh_target" "mkdir -p ${tmp_dir}" 2>&1); then
-        log_error "  Failed to connect to ${node}"
-        if [[ "$ssh_err" == *"Host key verification"* ]]; then
-            log_error "  Host key not accepted. Run: ssh ${ssh_target} 'echo connected'"
-        elif [[ "$ssh_err" == *"Permission denied"* ]]; then
-            log_error "  SSH key auth failed. Run: ssh-copy-id ${ssh_target}"
-        else
-            log_error "  SSH error: ${ssh_err}"
-        fi
+    if ! ssh -q -o BatchMode=yes "$ssh_target" "mkdir -p ${tmp_dir}" 2>/dev/null; then
+        log_error "  Failed to create temp directory on ${node}"
         return 1
     fi
 
@@ -300,8 +304,88 @@ distribute_to_node_sudo() {
         fi
     fi
 
-    # Use sudo to move files to final locations and set permissions
-    # Create a remote script file to avoid quoting issues with ssh -tt
+    # Use sudo to move files to final locations (passwordless - BatchMode)
+    local remote_cmd="
+        sudo mv ${tmp_dir}/munge.key /etc/munge/munge.key &&
+        sudo chown munge:munge /etc/munge/munge.key &&
+        sudo chmod 0400 /etc/munge/munge.key &&
+        sudo mv ${tmp_dir}/slurm.conf /etc/slurm/slurm.conf &&
+        sudo chown root:root /etc/slurm/slurm.conf &&
+        sudo chmod 0644 /etc/slurm/slurm.conf"
+
+    if [[ -f "${local_tmp}/cgroup.conf" ]]; then
+        remote_cmd="${remote_cmd} &&
+        sudo mv ${tmp_dir}/cgroup.conf /etc/slurm/cgroup.conf &&
+        sudo chown root:root /etc/slurm/cgroup.conf &&
+        sudo chmod 0644 /etc/slurm/cgroup.conf"
+    fi
+
+    remote_cmd="${remote_cmd} && rm -rf ${tmp_dir}"
+
+    if ! ssh -q -o BatchMode=yes "$ssh_target" "$remote_cmd" 2>/dev/null; then
+        log_error "  Failed to install files on ${node} (passwordless sudo may not be configured)"
+        log_info "    Test with: ssh ${ssh_target} 'sudo whoami'"
+        failed=true
+        ssh -q -o BatchMode=yes "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
+    fi
+
+    $failed && return 1
+    return 0
+}
+
+# Distribute files using regular user SSH + sudo with password prompt.
+distribute_to_node_sudo_password() {
+    local node="$1"
+    local ssh_target="${SSH_USER}@${node}"
+    local failed=false
+    local tmp_dir="/tmp/slurm-dist.$$"
+
+    # Create local temp dir for files we may need to read with sudo
+    local local_tmp
+    local_tmp=$(mktemp -d)
+    trap "rm -rf '$local_tmp'" RETURN
+
+    # Read files locally (may need sudo)
+    local_read_file /etc/munge/munge.key > "${local_tmp}/munge.key" || {
+        log_error "  Failed to read local munge.key"
+        return 1
+    }
+    local_read_file /etc/slurm/slurm.conf > "${local_tmp}/slurm.conf" || {
+        log_error "  Failed to read local slurm.conf"
+        return 1
+    }
+    if local_sudo test -f /etc/slurm/cgroup.conf 2>/dev/null; then
+        local_read_file /etc/slurm/cgroup.conf > "${local_tmp}/cgroup.conf" || {
+            log_error "  Failed to read local cgroup.conf"
+            return 1
+        }
+    fi
+
+    # Create temp directory on remote
+    if ! ssh -q -o BatchMode=yes "$ssh_target" "mkdir -p ${tmp_dir}" 2>/dev/null; then
+        log_error "  Failed to create temp directory on ${node}"
+        return 1
+    fi
+
+    # Copy files to temp location on remote
+    if ! scp -q -o BatchMode=yes "${local_tmp}/munge.key" "${ssh_target}:${tmp_dir}/munge.key" 2>/dev/null; then
+        log_error "  Failed to copy munge.key to ${node}"
+        failed=true
+    fi
+
+    if ! scp -q -o BatchMode=yes "${local_tmp}/slurm.conf" "${ssh_target}:${tmp_dir}/slurm.conf" 2>/dev/null; then
+        log_error "  Failed to copy slurm.conf to ${node}"
+        failed=true
+    fi
+
+    if [[ -f "${local_tmp}/cgroup.conf" ]]; then
+        if ! scp -q -o BatchMode=yes "${local_tmp}/cgroup.conf" "${ssh_target}:${tmp_dir}/cgroup.conf" 2>/dev/null; then
+            log_error "  Failed to copy cgroup.conf to ${node}"
+            failed=true
+        fi
+    fi
+
+    # Create remote install script (avoids quoting issues with ssh -tt)
     local remote_script="${tmp_dir}/install.sh"
 
     {
@@ -321,11 +405,10 @@ distribute_to_node_sudo() {
         echo "rm -rf ${tmp_dir}"
     } | ssh -q -o BatchMode=yes "$ssh_target" "cat > ${remote_script} && chmod +x ${remote_script}"
 
-    log_info "  Installing files (sudo may prompt for password)..."
+    log_info "  Installing files (sudo password required)..."
     if ! ssh -tt "$ssh_target" "${remote_script}" </dev/tty; then
         log_error "  Failed to install files on ${node}"
         failed=true
-        # Try to clean up temp dir
         ssh -q -o BatchMode=yes "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
     fi
 
@@ -380,11 +463,17 @@ setup_remote_nodes() {
     done
     echo
 
-    if $SSH_SUDO; then
-        log_info "Will SSH as ${SSH_USER}@<node> and use sudo for privileged operations."
-    else
-        log_info "Will SSH as root@<node> directly."
-    fi
+    case "$SSH_MODE" in
+        root)
+            log_info "Will SSH as root@<node> directly."
+            ;;
+        sudo_passwordless)
+            log_info "Will SSH as ${SSH_USER}@<node> with passwordless sudo."
+            ;;
+        sudo_password)
+            log_info "Will SSH as ${SSH_USER}@<node> with sudo (password prompt per node)."
+            ;;
+    esac
     log_warn "Ensure SSH key-based authentication is configured."
     echo
 
@@ -631,6 +720,7 @@ gather_compute_nodes() {
             local nodename_line
             nodename_line=$(format_nodename_line)
             COMPUTE_NODES="$nodename_line"
+            CONTROLLER_IS_COMPUTE=true
             log_success "Added: ${nodename_line}"
         fi
     fi
@@ -717,11 +807,17 @@ show_summary() {
             lines+=("  - MariaDB + slurmdbd (accounting)")
             lines+=("  - slurmctld (controller)")
             lines+=("  - slurm-client (CLI tools)")
+            if $CONTROLLER_IS_COMPUTE; then
+                lines+=("  - slurmd (compute daemon — this node is also a compute node)")
+            fi
             ;;
         controller)
             lines+=("  - MUNGE (auth, key generation)")
             lines+=("  - slurmctld (controller)")
             lines+=("  - slurm-client (CLI tools)")
+            if $CONTROLLER_IS_COMPUTE; then
+                lines+=("  - slurmd (compute daemon — this node is also a compute node)")
+            fi
             ;;
         database)
             lines+=("  - MUNGE (auth, key import)")
@@ -766,9 +862,19 @@ run_install() {
         controller_db)
             setup_database
             setup_controller
+            if $CONTROLLER_IS_COMPUTE; then
+                log_info "This controller is also a compute node — installing slurmd..."
+                install_compute_packages
+                start_slurmd
+            fi
             ;;
         controller)
             setup_controller
+            if $CONTROLLER_IS_COMPUTE; then
+                log_info "This controller is also a compute node — installing slurmd..."
+                install_compute_packages
+                start_slurmd
+            fi
             ;;
         database)
             setup_database
