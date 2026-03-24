@@ -102,8 +102,9 @@ generate_slurmdbd_conf() {
 
     render_template "$template" "$conf_file" vars
 
-    # slurmdbd.conf MUST be 0600 owned by root:slurm
-    chown root:slurm "$conf_file"
+    # slurmdbd.conf MUST be 0600 owned by slurm:slurm
+    # (slurmdbd runs as User=slurm and needs to read this file)
+    chown slurm:slurm "$conf_file"
     chmod 0600 "$conf_file"
 
     log_success "slurmdbd.conf written to ${conf_file} (mode 0600)."
