@@ -174,6 +174,10 @@ distribute_to_node() {
         sudo_password)
             distribute_to_node_sudo_password "$node" || failed=true
             ;;
+        *)
+            log_error "  Internal error: invalid SSH_MODE '${SSH_MODE}'"
+            failed=true
+            ;;
     esac
 
     if $failed; then
@@ -387,23 +391,32 @@ distribute_to_node_sudo_password() {
 
     # Create remote install script (avoids quoting issues with ssh -tt)
     local remote_script="${tmp_dir}/install.sh"
+    local script_content
+    script_content="#!/bin/bash
+set -e
+sudo mv ${tmp_dir}/munge.key /etc/munge/munge.key
+sudo chown munge:munge /etc/munge/munge.key
+sudo chmod 0400 /etc/munge/munge.key
+sudo mv ${tmp_dir}/slurm.conf /etc/slurm/slurm.conf
+sudo chown root:root /etc/slurm/slurm.conf
+sudo chmod 0644 /etc/slurm/slurm.conf"
 
-    {
-        echo '#!/bin/bash'
-        echo 'set -e'
-        echo "sudo mv ${tmp_dir}/munge.key /etc/munge/munge.key"
-        echo 'sudo chown munge:munge /etc/munge/munge.key'
-        echo 'sudo chmod 0400 /etc/munge/munge.key'
-        echo "sudo mv ${tmp_dir}/slurm.conf /etc/slurm/slurm.conf"
-        echo 'sudo chown root:root /etc/slurm/slurm.conf'
-        echo 'sudo chmod 0644 /etc/slurm/slurm.conf'
-        if [[ -f "${local_tmp}/cgroup.conf" ]]; then
-            echo "sudo mv ${tmp_dir}/cgroup.conf /etc/slurm/cgroup.conf"
-            echo 'sudo chown root:root /etc/slurm/cgroup.conf'
-            echo 'sudo chmod 0644 /etc/slurm/cgroup.conf'
-        fi
-        echo "rm -rf ${tmp_dir}"
-    } | ssh -q -o BatchMode=yes "$ssh_target" "cat > ${remote_script} && chmod +x ${remote_script}"
+    if [[ -f "${local_tmp}/cgroup.conf" ]]; then
+        script_content="${script_content}
+sudo mv ${tmp_dir}/cgroup.conf /etc/slurm/cgroup.conf
+sudo chown root:root /etc/slurm/cgroup.conf
+sudo chmod 0644 /etc/slurm/cgroup.conf"
+    fi
+
+    script_content="${script_content}
+rm -rf ${tmp_dir}"
+
+    if ! echo "$script_content" | ssh -q -o BatchMode=yes "$ssh_target" "cat > ${remote_script} && chmod +x ${remote_script}"; then
+        log_error "  Failed to create install script on ${node}"
+        failed=true
+        ssh -q -o BatchMode=yes "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
+        return 1
+    fi
 
     log_info "  Installing files (sudo password required)..."
     if ! ssh -tt "$ssh_target" "${remote_script}" </dev/tty; then
@@ -472,6 +485,9 @@ setup_remote_nodes() {
             ;;
         sudo_password)
             log_info "Will SSH as ${SSH_USER}@<node> with sudo (password prompt per node)."
+            ;;
+        *)
+            die "Internal error: SSH_MODE not set. Run select_ssh_mode first."
             ;;
     esac
     log_warn "Ensure SSH key-based authentication is configured."
