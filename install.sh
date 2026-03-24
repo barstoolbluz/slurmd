@@ -917,6 +917,14 @@ verify_install() {
                     ok=false
                 fi
             done
+            if $CONTROLLER_IS_COMPUTE; then
+                if is_service_active slurmd; then
+                    log_success "slurmd.service is running (controller is also a compute node)."
+                else
+                    log_error "slurmd.service is NOT running."
+                    ok=false
+                fi
+            fi
             ;;
         controller)
             if is_service_active slurmctld; then
@@ -924,6 +932,14 @@ verify_install() {
             else
                 log_error "slurmctld.service is NOT running."
                 ok=false
+            fi
+            if $CONTROLLER_IS_COMPUTE; then
+                if is_service_active slurmd; then
+                    log_success "slurmd.service is running (controller is also a compute node)."
+                else
+                    log_error "slurmd.service is NOT running."
+                    ok=false
+                fi
             fi
             ;;
         database)
