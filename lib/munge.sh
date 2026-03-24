@@ -7,6 +7,9 @@ MUNGE_KEY="/etc/munge/munge.key"
 install_munge() {
     log_step "Installing MUNGE authentication"
 
+    # Note: Debian's munge package postinst script automatically generates a key
+    # via `mungekey -c` if /etc/munge/munge.key doesn't exist. This means a fresh
+    # install will already have a key before generate_munge_key() runs.
     apt_install munge libmunge2
 
     log_success "MUNGE packages installed."
@@ -16,11 +19,37 @@ generate_munge_key() {
     log_info "Generating new MUNGE key..."
 
     if [[ -f "$MUNGE_KEY" ]]; then
-        if confirm "Existing MUNGE key found. Overwrite it?" "default_no"; then
-            backup_file "$MUNGE_KEY"
+        local key_size
+        key_size=$(stat -c%s "$MUNGE_KEY" 2>/dev/null || echo 0)
+
+        # Debian's munge postinst runs `mungekey -c` which creates a 128-byte
+        # (1024-bit) key. Our dd command creates a 1024-byte key. If we see a
+        # 128-byte key, it's almost certainly the auto-generated throwaway.
+        if (( key_size == 128 )); then
+            echo
+            log_warn "An existing MUNGE key was found, but it appears to be the"
+            log_warn "auto-generated key created by the Debian munge package during"
+            log_warn "installation. This key is unique to this machine and won't"
+            log_warn "work with other nodes in your cluster."
+            echo
+            log_info "For the controller node, you should generate a new key and"
+            log_info "distribute it to all other nodes."
+            echo
+            if confirm "Replace the auto-generated key with a new one?" "default_yes"; then
+                backup_file "$MUNGE_KEY"
+            else
+                log_info "Keeping existing MUNGE key."
+                return 0
+            fi
         else
-            log_info "Keeping existing MUNGE key."
-            return 0
+            # Key exists but isn't the 128-byte auto-generated size — likely
+            # intentionally created or imported from another node.
+            if confirm "Existing MUNGE key found. Overwrite it?" "default_no"; then
+                backup_file "$MUNGE_KEY"
+            else
+                log_info "Keeping existing MUNGE key."
+                return 0
+            fi
         fi
     fi
 
@@ -44,10 +73,25 @@ import_munge_key() {
     echo
 
     if [[ -f "$MUNGE_KEY" ]]; then
-        log_info "Existing MUNGE key found at ${MUNGE_KEY}."
-        if confirm "Keep the existing key?" "default_yes"; then
-            set_munge_permissions
-            return 0
+        local key_size
+        key_size=$(stat -c%s "$MUNGE_KEY" 2>/dev/null || echo 0)
+
+        # Detect the auto-generated 128-byte key from Debian's munge postinst
+        if (( key_size == 128 )); then
+            echo
+            log_warn "An existing MUNGE key was found, but it appears to be the"
+            log_warn "auto-generated key created by the Debian munge package."
+            log_warn "This key won't match the controller's key."
+            echo
+            log_info "You need to import the MUNGE key from your controller node."
+            echo
+        else
+            # Key exists and isn't the auto-generated size — might be valid
+            log_info "Existing MUNGE key found at ${MUNGE_KEY}."
+            if confirm "Keep the existing key?" "default_yes"; then
+                set_munge_permissions
+                return 0
+            fi
         fi
     fi
 

@@ -29,6 +29,8 @@ The installer walks you through selecting a node role and configuring the cluste
 5. **Login nodes**
 6. On the controller: add compute NodeName lines to slurm.conf, then `scontrol reconfigure`
 
+> **Note:** Debian's munge package automatically generates a key during installation if none exists. The installer detects this and prompts before overwriting. On the controller, you typically want to generate a fresh key; on other nodes, you'll import the controller's key.
+
 ## Repository layout
 
 ```
