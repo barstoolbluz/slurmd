@@ -60,11 +60,7 @@ generate_munge_key() {
     log_success "MUNGE key generated at ${MUNGE_KEY}"
     echo
     log_warn "IMPORTANT: You must copy this key to ALL other nodes in the cluster."
-    log_warn "The key must be identical on every node."
-    echo
-    log_info "To copy the key to another node, run:"
-    echo -e "  ${CYAN}sudo scp ${MUNGE_KEY} root@<node>:${MUNGE_KEY}${RESET}"
-    echo -e "  ${CYAN}ssh root@<node> 'chown munge:munge ${MUNGE_KEY} && chmod 0400 ${MUNGE_KEY}'${RESET}"
+    log_warn "The key must be identical on every node, owned by munge:munge with mode 0400."
     echo
 }
 
