@@ -186,6 +186,86 @@ is_valid_ip() {
     return 0
 }
 
+# ── Hostname Resolution ────────────────────────────────────────────────────
+
+# Check if a hostname is resolvable (via DNS or /etc/hosts).
+# Usage: is_hostname_resolvable "hostname"
+# Returns: 0 if resolvable, 1 if not
+is_hostname_resolvable() {
+    local hostname="$1"
+    getent hosts "$hostname" &>/dev/null
+}
+
+# Add a hostname/IP mapping to /etc/hosts.
+# Usage: add_to_hosts_file "192.168.1.100" "compute01"
+# Skips if entry already exists.
+add_to_hosts_file() {
+    local ip="$1"
+    local hostname="$2"
+    local hosts_file="/etc/hosts"
+
+    # Check if already present (exact hostname match on this IP)
+    if grep -qE "^${ip}[[:space:]]+(.*[[:space:]]+)?${hostname}([[:space:]]|$)" "$hosts_file" 2>/dev/null; then
+        log_info "${hostname} already in ${hosts_file}"
+        return 0
+    fi
+
+    # Check if hostname exists with different IP
+    if grep -qE "^[^#]*[[:space:]]${hostname}([[:space:]]|$)" "$hosts_file" 2>/dev/null; then
+        log_warn "${hostname} exists in ${hosts_file} with different IP:"
+        grep -E "^[^#]*[[:space:]]${hostname}([[:space:]]|$)" "$hosts_file" | head -1
+        if ! confirm "Add new entry anyway?" "default_no"; then
+            return 1
+        fi
+    fi
+
+    backup_file "$hosts_file"
+    echo -e "${ip}\t${hostname}" >> "$hosts_file"
+    log_success "Added ${hostname} (${ip}) to ${hosts_file}"
+}
+
+# Ensure a hostname is resolvable. If not, prompt for IP and add to /etc/hosts.
+# Usage: ensure_host_resolvable "compute01" ["optional context message"]
+# Returns: 0 on success, 1 if user declines or invalid input
+ensure_host_resolvable() {
+    local hostname="$1"
+    local context="${2:-}"
+
+    # Skip if it's already an IP address
+    if is_valid_ip "$hostname"; then
+        return 0
+    fi
+
+    # Check if already resolvable
+    if is_hostname_resolvable "$hostname"; then
+        return 0
+    fi
+
+    # Not resolvable - prompt for IP
+    echo
+    log_warn "Cannot resolve hostname: ${hostname}"
+    if [[ -n "$context" ]]; then
+        echo -e "  ${context}"
+    fi
+    echo -e "  Slurm requires all node hostnames to be resolvable."
+    echo
+
+    if ! confirm "Add ${hostname} to /etc/hosts?" "default_yes"; then
+        log_warn "Skipping — ${hostname} may not be reachable"
+        return 1
+    fi
+
+    prompt_input "IP address for ${hostname}"
+    local ip="$REPLY"
+
+    if ! is_valid_ip "$ip"; then
+        log_error "Invalid IP address: ${ip}"
+        return 1
+    fi
+
+    add_to_hosts_file "$ip" "$hostname"
+}
+
 # ── Hardware Detection ──────────────────────────────────────────────────────
 
 # Detect local hardware from /proc without requiring slurmd.

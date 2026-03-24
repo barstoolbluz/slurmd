@@ -119,6 +119,14 @@ gather_config() {
         fi
     fi
 
+    # Ensure controller hostname is resolvable (for non-controller roles)
+    case "$NODE_ROLE" in
+        compute|login|database)
+            ensure_host_resolvable "$CONTROLLER_HOSTNAME" \
+                "This node needs to communicate with the controller."
+            ;;
+    esac
+
     # Database hostname
     case "$NODE_ROLE" in
         controller_db)
@@ -141,6 +149,12 @@ gather_config() {
             fi
             ;;
     esac
+
+    # Ensure database hostname is resolvable (if different from controller)
+    if [[ -n "${DBD_HOSTNAME:-}" && "$DBD_HOSTNAME" != "$CONTROLLER_HOSTNAME" ]]; then
+        ensure_host_resolvable "$DBD_HOSTNAME" \
+            "This node needs to communicate with the database server."
+    fi
 
     # Database credentials (only for roles that set up MariaDB)
     case "$NODE_ROLE" in
@@ -228,12 +242,29 @@ gather_compute_nodes() {
         fi
 
         # If the user entered the short form: "hostname cpus memory"
-        if [[ "$line" =~ ^([]a-zA-Z0-9_[.-]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+        # Matches simple hostnames (node01) and Slurm ranges (node[01-10])
+        if [[ "$line" =~ ^([^[:space:]]+)[[:space:]]+([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
             local name="${BASH_REMATCH[1]}"
             local cpus="${BASH_REMATCH[2]}"
             local mem="${BASH_REMATCH[3]}"
             line="NodeName=${name} CPUs=${cpus} RealMemory=${mem} State=UNKNOWN"
             log_info "Expanded to: ${line}"
+        fi
+
+        # Extract hostname and ensure it's resolvable
+        local node_hostname=""
+        if [[ "$line" =~ NodeName=([^[:space:]]+) ]]; then
+            node_hostname="${BASH_REMATCH[1]}"
+        fi
+
+        if [[ -n "$node_hostname" ]]; then
+            # Skip node ranges like node[01-10] — would need manual /etc/hosts entries
+            if [[ "$node_hostname" =~ \[ ]]; then
+                log_info "Node range detected — add individual hosts to /etc/hosts manually if needed."
+            else
+                ensure_host_resolvable "$node_hostname" \
+                    "The controller needs to communicate with this compute node."
+            fi
         fi
 
         if [[ -n "$COMPUTE_NODES" ]]; then
