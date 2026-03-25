@@ -299,10 +299,14 @@ update_node_config() {
 # Usage: review_node_configs "node1\nnode2\n..."
 # Requires: SSH_MODE and SSH_USER globals to be set.
 review_node_configs() {
-    local nodes="$1"
+    local nodes_input="$1"
     local changes_made=false
 
-    while IFS= read -r node; do
+    # Convert newline-separated string to array (preserves stdin for interactive prompts)
+    local -a nodes_array
+    mapfile -t nodes_array <<< "$nodes_input"
+
+    for node in "${nodes_array[@]}"; do
         [[ -z "$node" ]] && continue
 
         # Get current config (escape dots in node name for regex - FQDNs contain dots)
@@ -354,7 +358,7 @@ review_node_configs() {
                 fi
                 ;;
         esac
-    done <<< "$nodes"
+    done
 
     if $changes_made; then
         echo
