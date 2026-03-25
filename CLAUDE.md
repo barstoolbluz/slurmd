@@ -44,6 +44,13 @@ render_template "$template" "$output_file" vars
 - `prompt_input "label" ["default"]` — result in `$REPLY`
 - `menu_select "prompt" "opt1" "opt2"` — result (1-indexed) in `$REPLY`
 
+### Installer State Tracking
+Tracks packages installed by the installer (vs. pre-existing) for clean uninstalls:
+- State file: `/etc/slurm/.installer-state`
+- `record_installed_package "pkg"` — records that we installed a package
+- `was_installed_by_us "pkg"` — returns 0 if we installed it, 1 otherwise
+- Used for chrony and mariadb-server; uninstall only offers to remove what we installed
+
 ### SSH Modes for --setup-nodes
 Three modes supported via `SSH_MODE` global:
 - `root` — direct root SSH
