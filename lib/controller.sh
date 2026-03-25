@@ -55,12 +55,21 @@ generate_slurm_conf() {
         partition_defs="# PartitionName=batch Nodes=compute[01-10] Default=YES MaxTime=INFINITE State=UP"
     fi
 
+    # Determine GRES types based on whether any node has GPU resources
+    local gres_types=""
+    if echo "${COMPUTE_NODES:-}" | grep -qE 'Gres=gpu'; then
+        gres_types="GresTypes=gpu"
+    else
+        gres_types="# GresTypes=gpu  # Uncomment if you add GPU nodes"
+    fi
+
     declare -A vars=(
         [GENERATED_DATE]="$(date '+%Y-%m-%d %H:%M:%S')"
         [CLUSTER_NAME]="${CLUSTER_NAME}"
         [CONTROLLER_HOSTNAME]="${CONTROLLER_HOSTNAME}"
         [ACCOUNTING_STORAGE_TYPE]="${acct_type}"
         [ACCOUNTING_STORAGE_EXTRA]="${acct_extra}"
+        [GRES_TYPES]="${gres_types}"
         [NODE_DEFINITIONS]="${node_defs}"
         [PARTITION_DEFINITIONS]="${partition_defs}"
     )
@@ -93,6 +102,35 @@ generate_cgroup_conf() {
     chmod 0644 "$conf_file"
 
     log_info "cgroup.conf written to ${conf_file}."
+}
+
+# Generate gres.conf for GPU support (controller-as-compute case).
+# Only creates gres.conf if NVIDIA GPUs are detected.
+generate_gres_conf() {
+    local conf_file="/etc/slurm/gres.conf"
+    local template="${SCRIPT_DIR}/config/templates/gres.conf.tmpl"
+
+    # Only needed if this node has GPUs
+    if [[ "${LOCAL_HAS_NVIDIA:-false}" != "true" ]]; then
+        log_info "No NVIDIA GPUs detected — skipping gres.conf."
+        return 0
+    fi
+
+    if [[ -f "$conf_file" ]]; then
+        log_info "gres.conf already exists, keeping it."
+        return 0
+    fi
+
+    declare -A vars=(
+        [GENERATED_DATE]="$(date '+%Y-%m-%d %H:%M:%S')"
+    )
+
+    render_template "$template" "$conf_file" vars
+
+    chown root:root "$conf_file"
+    chmod 0644 "$conf_file"
+
+    log_info "gres.conf written to ${conf_file}."
 }
 
 start_slurmctld() {

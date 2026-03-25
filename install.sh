@@ -213,6 +213,9 @@ distribute_to_node_root() {
         if local_sudo test -f /etc/slurm/cgroup.conf 2>/dev/null; then
             local_read_file /etc/slurm/cgroup.conf > "${local_tmp}/cgroup.conf"
         fi
+        if local_sudo test -f /etc/slurm/gres.conf 2>/dev/null; then
+            local_read_file /etc/slurm/gres.conf > "${local_tmp}/gres.conf"
+        fi
 
         # Copy from temp files
         if ! scp -q -o BatchMode=yes "${local_tmp}/munge.key" "${ssh_target}:/etc/munge/munge.key" 2>/dev/null; then
@@ -229,6 +232,12 @@ distribute_to_node_root() {
                 failed=true
             fi
         fi
+        if [[ -f "${local_tmp}/gres.conf" ]]; then
+            if ! scp -q -o BatchMode=yes "${local_tmp}/gres.conf" "${ssh_target}:/etc/slurm/gres.conf" 2>/dev/null; then
+                log_error "  Failed to copy gres.conf to ${node}"
+                failed=true
+            fi
+        fi
     else
         # Running as root locally - direct copy
         if ! scp -q -o BatchMode=yes /etc/munge/munge.key "${ssh_target}:/etc/munge/munge.key" 2>/dev/null; then
@@ -242,6 +251,12 @@ distribute_to_node_root() {
         if [[ -f /etc/slurm/cgroup.conf ]]; then
             if ! scp -q -o BatchMode=yes /etc/slurm/cgroup.conf "${ssh_target}:/etc/slurm/cgroup.conf" 2>/dev/null; then
                 log_error "  Failed to copy cgroup.conf to ${node}"
+                failed=true
+            fi
+        fi
+        if [[ -f /etc/slurm/gres.conf ]]; then
+            if ! scp -q -o BatchMode=yes /etc/slurm/gres.conf "${ssh_target}:/etc/slurm/gres.conf" 2>/dev/null; then
+                log_error "  Failed to copy gres.conf to ${node}"
                 failed=true
             fi
         fi
@@ -291,6 +306,12 @@ distribute_to_node_sudo_passwordless() {
             return 1
         }
     fi
+    if local_sudo test -f /etc/slurm/gres.conf 2>/dev/null; then
+        local_read_file /etc/slurm/gres.conf > "${local_tmp}/gres.conf" || {
+            log_error "  Failed to read local gres.conf"
+            return 1
+        }
+    fi
 
     # Create temp directory on remote
     if ! ssh -q -o BatchMode=yes "$ssh_target" "mkdir -p ${tmp_dir}" 2>/dev/null; then
@@ -316,6 +337,13 @@ distribute_to_node_sudo_passwordless() {
         fi
     fi
 
+    if [[ -f "${local_tmp}/gres.conf" ]]; then
+        if ! scp -q -o BatchMode=yes "${local_tmp}/gres.conf" "${ssh_target}:${tmp_dir}/gres.conf" 2>/dev/null; then
+            log_error "  Failed to copy gres.conf to ${node}"
+            failed=true
+        fi
+    fi
+
     # Use sudo to move files to final locations and restart services (passwordless - BatchMode)
     local remote_cmd="
         sudo mv ${tmp_dir}/munge.key /etc/munge/munge.key &&
@@ -330,6 +358,13 @@ distribute_to_node_sudo_passwordless() {
         sudo mv ${tmp_dir}/cgroup.conf /etc/slurm/cgroup.conf &&
         sudo chown root:root /etc/slurm/cgroup.conf &&
         sudo chmod 0644 /etc/slurm/cgroup.conf"
+    fi
+
+    if [[ -f "${local_tmp}/gres.conf" ]]; then
+        remote_cmd="${remote_cmd} &&
+        sudo mv ${tmp_dir}/gres.conf /etc/slurm/gres.conf &&
+        sudo chown root:root /etc/slurm/gres.conf &&
+        sudo chmod 0644 /etc/slurm/gres.conf"
     fi
 
     # Restart services after file installation
@@ -376,6 +411,12 @@ distribute_to_node_sudo_password() {
             return 1
         }
     fi
+    if local_sudo test -f /etc/slurm/gres.conf 2>/dev/null; then
+        local_read_file /etc/slurm/gres.conf > "${local_tmp}/gres.conf" || {
+            log_error "  Failed to read local gres.conf"
+            return 1
+        }
+    fi
 
     # Create temp directory on remote
     if ! ssh -q -o BatchMode=yes "$ssh_target" "mkdir -p ${tmp_dir}" 2>/dev/null; then
@@ -397,6 +438,13 @@ distribute_to_node_sudo_password() {
     if [[ -f "${local_tmp}/cgroup.conf" ]]; then
         if ! scp -q -o BatchMode=yes "${local_tmp}/cgroup.conf" "${ssh_target}:${tmp_dir}/cgroup.conf" 2>/dev/null; then
             log_error "  Failed to copy cgroup.conf to ${node}"
+            failed=true
+        fi
+    fi
+
+    if [[ -f "${local_tmp}/gres.conf" ]]; then
+        if ! scp -q -o BatchMode=yes "${local_tmp}/gres.conf" "${ssh_target}:${tmp_dir}/gres.conf" 2>/dev/null; then
+            log_error "  Failed to copy gres.conf to ${node}"
             failed=true
         fi
     fi
@@ -429,6 +477,13 @@ sudo chmod 0644 /etc/slurm/slurm.conf"
 sudo mv ${tmp_dir}/cgroup.conf /etc/slurm/cgroup.conf
 sudo chown root:root /etc/slurm/cgroup.conf
 sudo chmod 0644 /etc/slurm/cgroup.conf"
+    fi
+
+    if [[ -f "${local_tmp}/gres.conf" ]]; then
+        script_content="${script_content}
+sudo mv ${tmp_dir}/gres.conf /etc/slurm/gres.conf
+sudo chown root:root /etc/slurm/gres.conf
+sudo chmod 0644 /etc/slurm/gres.conf"
     fi
 
     # Add service restarts to the script
@@ -1036,6 +1091,7 @@ run_install() {
             if $CONTROLLER_IS_COMPUTE; then
                 log_info "This controller is also a compute node — installing slurmd..."
                 install_compute_packages
+                generate_gres_conf
                 start_slurmd
             fi
             ;;
@@ -1044,6 +1100,7 @@ run_install() {
             if $CONTROLLER_IS_COMPUTE; then
                 log_info "This controller is also a compute node — installing slurmd..."
                 install_compute_packages
+                generate_gres_conf
                 start_slurmd
             fi
             ;;

@@ -397,12 +397,37 @@ detect_local_hardware() {
         log_warn "Container detected — hardware values may reflect the host system."
     fi
 
+    # Detect NVIDIA GPUs (optional - does not fail overall detection)
+    detect_nvidia_gpus || true
+
     return 0
+}
+
+# Detect NVIDIA GPUs on the local system.
+# Sets: LOCAL_GPU_COUNT, LOCAL_HAS_NVIDIA
+# Returns 0 if GPUs found, 1 otherwise (not a failure - just no GPUs).
+detect_nvidia_gpus() {
+    LOCAL_GPU_COUNT=0
+    LOCAL_HAS_NVIDIA=false
+
+    if ! command -v nvidia-smi &>/dev/null; then
+        return 1
+    fi
+
+    local count
+    count=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits 2>/dev/null | head -1)
+
+    if [[ -n "$count" && "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
+        LOCAL_GPU_COUNT="$count"
+        LOCAL_HAS_NVIDIA=true
+        return 0
+    fi
+    return 1
 }
 
 # Generate a complete NodeName line from LOCAL_* variables.
 # Usage: format_nodename_line
-# Output: NodeName=<hostname> CPUs=<n> RealMemory=<MB> Sockets=<n> CoresPerSocket=<n> ThreadsPerCore=<n> State=UNKNOWN
+# Output: NodeName=<hostname> CPUs=<n> RealMemory=<MB> Sockets=<n> CoresPerSocket=<n> ThreadsPerCore=<n> [Gres=gpu:<n>] State=UNKNOWN
 # Requires: detect_local_hardware() must be called first.
 format_nodename_line() {
     # Verify all required variables are set
@@ -411,7 +436,14 @@ format_nodename_line() {
         return 1
     fi
 
-    echo "NodeName=${LOCAL_HOSTNAME} CPUs=${LOCAL_CPUS} RealMemory=${LOCAL_MEMORY_MB} Sockets=${LOCAL_SOCKETS:-1} CoresPerSocket=${LOCAL_CORES_PER_SOCKET:-${LOCAL_CPUS}} ThreadsPerCore=${LOCAL_THREADS_PER_CORE:-1} State=UNKNOWN"
+    local line="NodeName=${LOCAL_HOSTNAME} CPUs=${LOCAL_CPUS} RealMemory=${LOCAL_MEMORY_MB} Sockets=${LOCAL_SOCKETS:-1} CoresPerSocket=${LOCAL_CORES_PER_SOCKET:-${LOCAL_CPUS}} ThreadsPerCore=${LOCAL_THREADS_PER_CORE:-1}"
+
+    # Add GRES for NVIDIA GPUs if detected
+    if [[ "${LOCAL_HAS_NVIDIA:-false}" == "true" && "${LOCAL_GPU_COUNT:-0}" -gt 0 ]]; then
+        line="${line} Gres=gpu:${LOCAL_GPU_COUNT}"
+    fi
+
+    echo "${line} State=UNKNOWN"
 }
 
 # Display detected hardware in a formatted summary box.
@@ -432,6 +464,9 @@ show_detected_hardware() {
     lines+=("${BOLD}Sockets:${RESET}           ${LOCAL_SOCKETS:-1}")
     lines+=("${BOLD}CoresPerSocket:${RESET}    ${LOCAL_CORES_PER_SOCKET:-${LOCAL_CPUS}}")
     lines+=("${BOLD}ThreadsPerCore:${RESET}    ${LOCAL_THREADS_PER_CORE:-1}")
+    if [[ "${LOCAL_HAS_NVIDIA:-false}" == "true" ]]; then
+        lines+=("${BOLD}NVIDIA GPUs:${RESET}       ${LOCAL_GPU_COUNT}")
+    fi
     lines+=("")
     lines+=("${BOLD}NodeName line:${RESET}")
     lines+=("  ${CYAN}${nodename_line}${RESET}")

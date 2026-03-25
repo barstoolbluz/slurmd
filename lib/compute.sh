@@ -104,6 +104,7 @@ generate_slurm_conf_interactive() {
     # Auto-detect this node's hardware
     local node_defs="# Compute nodes — ensure this matches the controller's slurm.conf"
     local partition_defs="# Partitions — ensure this matches the controller's slurm.conf"
+    local gres_types="# GresTypes=gpu  # Ensure this matches the controller's slurm.conf"
 
     declare -A vars=(
         [GENERATED_DATE]="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -111,6 +112,7 @@ generate_slurm_conf_interactive() {
         [CONTROLLER_HOSTNAME]="${CONTROLLER_HOSTNAME}"
         [ACCOUNTING_STORAGE_TYPE]="${acct_type}"
         [ACCOUNTING_STORAGE_EXTRA]="${acct_extra}"
+        [GRES_TYPES]="${gres_types}"
         [NODE_DEFINITIONS]="${node_defs}"
         [PARTITION_DEFINITIONS]="${partition_defs}"
     )
@@ -139,6 +141,35 @@ setup_cgroup_conf_compute() {
     chmod 0644 "$conf_file"
 
     log_info "cgroup.conf written to ${conf_file}."
+}
+
+# Set up gres.conf for GPU support on compute nodes.
+# Only creates gres.conf if NVIDIA GPUs are detected.
+setup_gres_conf_compute() {
+    local conf_file="/etc/slurm/gres.conf"
+    local template="${SCRIPT_DIR}/config/templates/gres.conf.tmpl"
+
+    # Only needed if this node has GPUs
+    if [[ "${LOCAL_HAS_NVIDIA:-false}" != "true" ]]; then
+        log_info "No NVIDIA GPUs detected — skipping gres.conf."
+        return 0
+    fi
+
+    if [[ -f "$conf_file" ]]; then
+        log_info "gres.conf already exists, keeping it."
+        return 0
+    fi
+
+    declare -A vars=(
+        [GENERATED_DATE]="$(date '+%Y-%m-%d %H:%M:%S')"
+    )
+
+    render_template "$template" "$conf_file" vars
+
+    chown root:root "$conf_file"
+    chmod 0644 "$conf_file"
+
+    log_success "gres.conf written to ${conf_file} (${LOCAL_GPU_COUNT} GPU(s) detected)."
 }
 
 detect_hardware() {
@@ -196,6 +227,7 @@ setup_compute() {
     install_compute_packages
     setup_slurm_conf_compute
     setup_cgroup_conf_compute
+    setup_gres_conf_compute
     detect_hardware
     start_slurmd
 }

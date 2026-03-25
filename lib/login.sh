@@ -80,6 +80,7 @@ generate_slurm_conf_login() {
         [CONTROLLER_HOSTNAME]="${CONTROLLER_HOSTNAME}"
         [ACCOUNTING_STORAGE_TYPE]="${acct_type}"
         [ACCOUNTING_STORAGE_EXTRA]="${acct_extra}"
+        [GRES_TYPES]="# GresTypes=gpu  # Ensure this matches the controller's slurm.conf"
         [NODE_DEFINITIONS]="# Node definitions must match the controller"
         [PARTITION_DEFINITIONS]="# Partition definitions must match the controller"
     )
