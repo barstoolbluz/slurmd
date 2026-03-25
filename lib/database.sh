@@ -5,7 +5,18 @@
 install_database_packages() {
     log_step "Installing database packages"
 
+    # Check if MariaDB is already installed
+    local mariadb_preinstalled=false
+    if dpkg -l mariadb-server 2>/dev/null | grep -q '^ii'; then
+        mariadb_preinstalled=true
+    fi
+
     apt_install mariadb-server slurmdbd slurm-wlm-basic-plugins slurm-wlm-mysql-plugin
+
+    # Record only if we actually installed MariaDB
+    if ! $mariadb_preinstalled; then
+        record_installed_package "mariadb-server"
+    fi
 
     log_success "Database packages installed."
 }

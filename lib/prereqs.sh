@@ -7,14 +7,26 @@
 setup_time_sync() {
     log_step "Configuring time synchronization"
 
+    # Check if any time sync service is already running
     if is_service_active "chrony" || is_service_active "chronyd" || is_service_active "systemd-timesyncd" || is_service_active "ntp" || is_service_active "ntpd"; then
         log_success "Time synchronization service already running."
         return 0
     fi
 
+    # Check if chrony is already installed (but not running)
+    local chrony_preinstalled=false
+    if dpkg -l chrony 2>/dev/null | grep -q '^ii'; then
+        chrony_preinstalled=true
+    fi
+
     log_info "Installing chrony for NTP time synchronization..."
     apt_install chrony
     enable_and_start chrony
+
+    # Record only if we actually installed it
+    if ! $chrony_preinstalled; then
+        record_installed_package "chrony"
+    fi
 
     log_success "Time synchronization configured with chrony."
 }

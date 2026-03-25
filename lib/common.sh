@@ -31,6 +31,45 @@ die() {
     exit 1
 }
 
+# ── Installer State Tracking ───────────────────────────────────────────────
+
+INSTALLER_STATE_FILE="/etc/slurm/.installer-state"
+
+# Record that we installed a package (for uninstall tracking).
+# Usage: record_installed_package "chrony"
+record_installed_package() {
+    local pkg="$1"
+    local state_dir
+    state_dir=$(dirname "$INSTALLER_STATE_FILE")
+
+    # Ensure directory exists
+    [[ -d "$state_dir" ]] || mkdir -p "$state_dir"
+
+    # Add header if file is new
+    if [[ ! -f "$INSTALLER_STATE_FILE" ]]; then
+        echo "# Installed by slurm-installer on $(date '+%Y-%m-%d %H:%M:%S')" > "$INSTALLER_STATE_FILE"
+    fi
+
+    # Record the package (uppercase, underscores)
+    local key="INSTALLED_${pkg^^}"
+    key="${key//-/_}"
+
+    # Only add if not already recorded
+    if ! grep -q "^${key}=" "$INSTALLER_STATE_FILE" 2>/dev/null; then
+        echo "${key}=true" >> "$INSTALLER_STATE_FILE"
+    fi
+}
+
+# Check if a package was installed by us.
+# Usage: if was_installed_by_us "chrony"; then ...
+was_installed_by_us() {
+    local pkg="$1"
+    local key="INSTALLED_${pkg^^}"
+    key="${key//-/_}"
+
+    [[ -f "$INSTALLER_STATE_FILE" ]] && grep -q "^${key}=true" "$INSTALLER_STATE_FILE" 2>/dev/null
+}
+
 # ── Prompts ─────────────────────────────────────────────────────────────────
 
 # Ask a yes/no question. Returns 0 for yes, 1 for no.
@@ -443,11 +482,21 @@ render_template() {
 uninstall_slurm() {
     log_step "Uninstalling Slurm"
 
+    # Read installer state BEFORE we might delete /etc/slurm
+    local we_installed_chrony=false
+    local we_installed_mariadb=false
+    if [[ -f "$INSTALLER_STATE_FILE" ]]; then
+        was_installed_by_us "chrony" && we_installed_chrony=true
+        was_installed_by_us "mariadb-server" && we_installed_mariadb=true
+    fi
+
     echo -e "${YELLOW}This will:${RESET}"
     echo "  - Stop all Slurm services (slurmctld, slurmdbd, slurmd, munge)"
     echo "  - Remove Slurm and MUNGE packages"
     echo "  - Optionally remove configuration files"
     echo "  - Optionally remove state/log directories"
+    $we_installed_mariadb && echo "  - Optionally remove MariaDB (installed by this installer)"
+    $we_installed_chrony && echo "  - Optionally remove chrony (installed by this installer)"
     echo
 
     if ! confirm "Proceed with uninstall?" "default_no"; then
@@ -493,6 +542,28 @@ uninstall_slurm() {
             log_success "Database dropped."
         else
             log_info "MariaDB not running, skipping database cleanup."
+        fi
+    fi
+
+    # MariaDB (only if we installed it)
+    if $we_installed_mariadb; then
+        if confirm "Remove MariaDB server (installed by this installer)?" "default_no"; then
+            log_info "Removing MariaDB..."
+            systemctl stop mariadb 2>/dev/null || true
+            DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y mariadb-server mariadb-client 2>/dev/null || true
+            DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || true
+            rm -rf /var/lib/mysql /etc/mysql
+            log_success "MariaDB removed."
+        fi
+    fi
+
+    # Chrony (only if we installed it)
+    if $we_installed_chrony; then
+        if confirm "Remove chrony (installed by this installer)?" "default_no"; then
+            log_info "Removing chrony..."
+            systemctl stop chrony 2>/dev/null || true
+            DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y chrony 2>/dev/null || true
+            log_success "Chrony removed."
         fi
     fi
 
