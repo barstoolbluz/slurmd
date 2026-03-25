@@ -14,7 +14,7 @@ The installer walks you through selecting a node role and configuring the cluste
 
 | Option | Description |
 |--------|-------------|
-| `--setup-nodes` | Distribute configs (munge.key, slurm.conf, cgroup.conf) to remote nodes via SSH |
+| `--setup-nodes` | Distribute configs (munge.key, slurm.conf, cgroup.conf, gres.conf) to remote nodes via SSH |
 | `--uninstall` | Remove Slurm and MUNGE packages, with options to clean configs and state |
 | `--help` | Show usage information |
 
@@ -34,7 +34,7 @@ The installer walks you through selecting a node role and configuring the cluste
 2. **Compute nodes** — run `slurmd -C` on each to get hardware lines, add them to slurm.conf on the controller
 3. **Distribute configs** to all nodes (choose one method):
    - **Automatic:** `./install.sh --setup-nodes` (requires SSH key auth)
-   - **Manual:** Copy `/etc/munge/munge.key`, `/etc/slurm/slurm.conf`, and `/etc/slurm/cgroup.conf` to each node
+   - **Manual:** Copy `/etc/munge/munge.key`, `/etc/slurm/slurm.conf`, `/etc/slurm/cgroup.conf`, and `/etc/slurm/gres.conf` (if present) to each node
 4. **Database node** (if separate from controller) — run installer before distributing configs
 5. **Login nodes** — run installer, then distribute configs
 6. On the controller: `scontrol reconfigure` to apply changes
@@ -51,7 +51,7 @@ After setting up the controller, use `--setup-nodes` to automatically distribute
 
 This will:
 - Read node definitions from `/etc/slurm/slurm.conf`
-- Copy munge.key, slurm.conf, and cgroup.conf to each node
+- Copy munge.key, slurm.conf, cgroup.conf, and gres.conf (if present) to each node
 - Restart munge and slurmd on remote nodes
 - Verify munge authentication to each node
 - Run `scontrol reconfigure` on the controller
@@ -94,6 +94,7 @@ config/
     slurm.conf.tmpl     slurm.conf template
     slurmdbd.conf.tmpl  slurmdbd.conf template
     cgroup.conf.tmpl    cgroup.conf template
+    gres.conf.tmpl      gres.conf template (GPU support)
 ```
 
 ## What the installer does
@@ -124,6 +125,7 @@ Generated configs land in `/etc/slurm/`. The installer backs up any existing fil
 | slurm.conf | `/etc/slurm/slurm.conf` | Must be identical on all nodes |
 | slurmdbd.conf | `/etc/slurm/slurmdbd.conf` | Database node only, mode 0600 |
 | cgroup.conf | `/etc/slurm/cgroup.conf` | Compute nodes |
+| gres.conf | `/etc/slurm/gres.conf` | GPU nodes only, auto-generated when NVIDIA GPUs detected |
 | munge.key | `/etc/munge/munge.key` | Must be identical on all nodes |
 
 ## Security considerations
@@ -151,6 +153,7 @@ The slurmdbd password is stored in `/etc/slurm/slurmdbd.conf`:
 | slurm.conf | 0644 | root:root | Must be world-readable for CLI tools |
 | slurmdbd.conf | 0600 | slurm:slurm | Contains DB password |
 | cgroup.conf | 0644 | root:root | Read by slurmd |
+| gres.conf | 0644 | root:root | Read by slurmd for GPU configuration |
 
 ## Requirements
 
@@ -344,6 +347,56 @@ The controller will appear in `sinfo` as both the controller and an available co
 
 > **Caution:** For production clusters, keep controller and compute roles separate. Running jobs on the controller can impact scheduling performance.
 
+## GPU support
+
+The installer automatically detects NVIDIA GPUs and configures Slurm for GPU scheduling.
+
+### How it works
+
+1. During hardware detection, `nvidia-smi` is queried to count GPUs
+2. If GPUs are found, `Gres=gpu:N` is added to the NodeName line
+3. On GPU nodes, `/etc/slurm/gres.conf` is generated with `AutoDetect=nvml`
+4. When any compute node has GPUs, `GresTypes=gpu` is enabled in slurm.conf
+
+### Requirements
+
+- NVIDIA drivers installed and working (`nvidia-smi` must be functional)
+- No manual GPU configuration needed — NVML auto-detects all GPUs
+
+### Verifying GPU configuration
+
+```bash
+# Check if GPUs are detected
+nvidia-smi
+
+# View GRES in slurm.conf
+grep -E 'GresTypes|Gres=' /etc/slurm/slurm.conf
+
+# Check gres.conf
+cat /etc/slurm/gres.conf
+
+# Show GPU resources in cluster
+sinfo -o "%N %G"
+```
+
+### Submitting GPU jobs
+
+```bash
+# Request 1 GPU
+srun --gres=gpu:1 nvidia-smi
+
+# Request 2 GPUs
+sbatch --gres=gpu:2 myjob.sh
+```
+
+### Mixed clusters (GPU + non-GPU nodes)
+
+The installer handles mixed clusters automatically:
+- `GresTypes=gpu` is enabled cluster-wide when any node has GPUs
+- Only GPU nodes include `Gres=gpu:N` in their NodeName definition
+- Only GPU nodes get a `gres.conf` file
+- Non-GPU nodes work normally without any GPU configuration
+
 ## Troubleshooting
 
 ### Nodes showing as DOWN or NOT_RESPONDING
@@ -388,12 +441,23 @@ slurm.conf must be world-readable (0644). Fix:
 sudo chmod 0644 /etc/slurm/slurm.conf
 ```
 
+### GPU jobs fail or GPUs not visible
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| `srun --gres=gpu:1` fails immediately | `GresTypes=gpu` not in slurm.conf | Add `GresTypes=gpu` to slurm.conf, run `scontrol reconfigure` |
+| GPUs not showing in `sinfo -o "%G"` | Node missing `Gres=gpu:N` | Add `Gres=gpu:N` to NodeName line in slurm.conf |
+| Job runs but `nvidia-smi` shows no GPUs | Missing gres.conf | Create `/etc/slurm/gres.conf` with `AutoDetect=nvml` |
+| `nvidia-smi` works but Slurm doesn't see GPUs | NVML detection failed | Check that nvidia-smi runs as slurm user: `sudo -u slurm nvidia-smi` |
+
 ## Known limitations
 
 This installer provides a straightforward single-cluster setup. It does not support:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
+| NVIDIA GPU scheduling | Supported | Auto-detected via nvidia-smi, uses NVML |
+| AMD/Intel GPUs | Not supported | Only NVIDIA GPUs with nvidia-smi |
 | High availability | Not supported | Single controller only, no failover |
 | Federation | Not supported | Single cluster only |
 | Non-Debian distros | Not supported | Debian 11, 12, 13 only |

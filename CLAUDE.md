@@ -35,7 +35,7 @@ render_template "$template" "$output_file" vars
 ```
 
 ### File Permissions
-- slurm.conf, cgroup.conf: `0644 root:root` (must be world-readable for sinfo/srun)
+- slurm.conf, cgroup.conf, gres.conf: `0644 root:root` (must be world-readable for sinfo/srun)
 - slurmdbd.conf: `0600 slurm:slurm` (contains DB password)
 - munge.key: `0400 munge:munge`
 
@@ -56,6 +56,14 @@ Three modes supported via `SSH_MODE` global:
 - `root` — direct root SSH
 - `sudo_passwordless` — user SSH + passwordless sudo
 - `sudo_password` — user SSH + sudo with password prompt (uses ssh -tt)
+
+### GPU Detection
+NVIDIA GPUs are auto-detected via `nvidia-smi`:
+- `detect_nvidia_gpus()` in common.sh sets `LOCAL_GPU_COUNT` and `LOCAL_HAS_NVIDIA`
+- Called automatically by `detect_local_hardware()`
+- `format_nodename_line()` adds `Gres=gpu:N` when GPUs detected
+- `generate_gres_conf()` / `setup_gres_conf_compute()` create gres.conf with `AutoDetect=nvml`
+- `GresTypes=gpu` added to slurm.conf when any compute node has GPUs
 
 ## Node Roles
 
