@@ -158,6 +158,7 @@ generate_gres_conf() {
 
 start_slurmctld() {
     log_step "Starting slurmctld"
+    setup_service_defaults "slurmctld" "SLURMCTLD_OPTIONS"
     enable_and_start slurmctld
 }
 

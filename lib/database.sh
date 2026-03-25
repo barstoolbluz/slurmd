@@ -338,6 +338,7 @@ generate_slurmdbd_conf() {
 
 start_slurmdbd() {
     log_step "Starting slurmdbd"
+    setup_service_defaults "slurmdbd" "SLURMDBD_OPTIONS"
 
     # If using container, ensure slurmdbd depends on it
     if $USE_MARIADB_CONTAINER; then

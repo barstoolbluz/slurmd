@@ -352,6 +352,7 @@ detect_hardware() {
 
 start_slurmd() {
     log_step "Starting slurmd"
+    setup_service_defaults "slurmd" "SLURMD_OPTIONS"
     enable_and_start slurmd
 }
 

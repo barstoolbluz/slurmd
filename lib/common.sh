@@ -765,6 +765,29 @@ enable_and_start() {
     fi
 }
 
+# Create /etc/default file for a Slurm service to silence systemd warnings.
+# The Debian systemd units reference $*_OPTIONS variables that cause warnings
+# if undefined. This creates the defaults file with an empty OPTIONS variable.
+# Usage: setup_service_defaults "slurmd" "SLURMD_OPTIONS"
+setup_service_defaults() {
+    local service="$1"
+    local var_name="$2"
+    local defaults_file="/etc/default/${service}"
+
+    # Don't overwrite if file already exists (user may have customized it)
+    if [[ -f "$defaults_file" ]]; then
+        return 0
+    fi
+
+    cat > "$defaults_file" <<EOF
+# Options passed to the ${service} daemon
+# Add command-line options here if needed (e.g., "-D -vvv" for debug mode).
+${var_name}=""
+EOF
+
+    chmod 0644 "$defaults_file"
+}
+
 # Install packages via apt, skipping already-installed ones.
 apt_install() {
     local packages=("$@")

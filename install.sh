@@ -45,6 +45,7 @@ SSH_MODE=""        # "root" | "sudo_passwordless" | "sudo_password"
 
 # Controller also acting as compute node
 CONTROLLER_IS_COMPUTE=false
+CONTROLLER_NODENAME=""
 
 # Prompt user to select SSH connection mode.
 # Sets SSH_USER and SSH_MODE globals.
@@ -1085,17 +1086,43 @@ gather_config() {
         [[ "$SLURM_GID" =~ ^[0-9]+$ ]] && (( SLURM_GID > 0 )) || die "Invalid GID: must be a positive integer"
     fi
 
+    # Controller-as-compute option (controller roles only)
+    case "$NODE_ROLE" in
+        controller|controller_db)
+            echo
+            log_info "A controller can also run jobs as a compute node."
+            log_info "This is common for small clusters or testing."
+
+            if confirm "Should this controller ALSO act as a compute node?" "default_no"; then
+                CONTROLLER_IS_COMPUTE=true
+                if detect_local_hardware; then
+                    show_detected_hardware
+                    CONTROLLER_NODENAME=$(format_nodename_line)
+                    log_success "Controller will be registered as compute node."
+                else
+                    log_warn "Could not auto-detect hardware."
+                    log_info "After installation, run 'slurmd -C' and add this node manually."
+                fi
+            fi
+            ;;
+    esac
+
     # Compute node definitions (controller roles only)
     case "$NODE_ROLE" in
         controller|controller_db)
             echo
-            log_info "You can define compute nodes now, or add them later."
+            log_info "You can define additional compute nodes now, or add them later."
             log_info "On each compute node, run 'slurmd -C' to get the hardware line."
             echo
-            if confirm "Define compute nodes now?" "default_no"; then
+            if confirm "Define additional compute nodes now?" "default_no"; then
                 gather_compute_nodes
             else
-                COMPUTE_NODES=""
+                # Initialize COMPUTE_NODES with controller nodename if applicable
+                if [[ -n "${CONTROLLER_NODENAME:-}" ]]; then
+                    COMPUTE_NODES="$CONTROLLER_NODENAME"
+                else
+                    COMPUTE_NODES=""
+                fi
                 log_info "To add compute nodes later, run: ${CYAN}./install.sh --setup-nodes${RESET}"
             fi
 
@@ -1106,24 +1133,15 @@ gather_config() {
 }
 
 gather_compute_nodes() {
-    COMPUTE_NODES=""
-
-    # Auto-detect hardware and offer to add this machine as a compute node
-    if detect_local_hardware; then
-        show_detected_hardware
-
-        echo -e "This is common for small clusters where the controller also runs jobs."
-        if confirm "Add THIS machine (${LOCAL_HOSTNAME}) as a compute node?" "default_no"; then
-            local nodename_line
-            nodename_line=$(format_nodename_line)
-            COMPUTE_NODES="$nodename_line"
-            CONTROLLER_IS_COMPUTE=true
-            log_success "Added: ${nodename_line}"
-        fi
+    # Include controller if it's also a compute node
+    if [[ -n "${CONTROLLER_NODENAME:-}" ]]; then
+        COMPUTE_NODES="$CONTROLLER_NODENAME"
+    else
+        COMPUTE_NODES=""
     fi
 
     echo
-    echo -e "Enter additional compute node definitions one per line."
+    echo -e "Enter compute node definitions one per line."
     echo -e "Format: ${CYAN}NodeName=<name> CPUs=<n> RealMemory=<MB> State=UNKNOWN${RESET}"
     echo -e "Or a shorter form: ${CYAN}<hostname> <cpus> <memory_mb>${RESET}"
     echo -e "Enter an empty line when done."

@@ -13,10 +13,11 @@ lib/
   prereqs.sh               # System setup (chrony, slurm user, directories, firewall)
   munge.sh                 # MUNGE authentication (key generation/import)
   database.sh              # MariaDB + slurmdbd setup
-  controller.sh            # slurmctld setup, slurm.conf generation
-  compute.sh               # slurmd setup
+  controller.sh            # slurmctld setup, slurm.conf generation, gres.conf generation
+  compute.sh               # slurmd setup, gres.conf generation
   login.sh                 # Client tools only (no daemons)
 config/templates/          # Configuration file templates with %%VAR%% placeholders
+                           # Note: gres.conf is generated dynamically, not from template
 ```
 
 ## Key Patterns
@@ -92,8 +93,28 @@ NVIDIA and AMD GPUs are auto-detected:
 - `detect_amd_gpus()` in common.sh sets `LOCAL_AMD_GPU_COUNT` and `LOCAL_HAS_AMD` via `rocm-smi`
 - Both called automatically by `detect_local_hardware()`, which computes `LOCAL_GPU_COUNT` as the total
 - `format_nodename_line()` adds `Gres=gpu:N` when any GPUs detected (combined count)
-- `generate_gres_conf()` / `setup_gres_conf_compute()` create gres.conf with `AutoDetect=any`
+- `generate_gres_conf()` (controller.sh) / `setup_gres_conf_compute()` (compute.sh) dynamically generate gres.conf
+- gres.conf is NOT templated — it's generated based on which GPU plugins are installed:
+  - `slurm-wlm-nvml-plugin` for NVIDIA (from Debian contrib repository)
+  - `slurm-wlm-rsmi-plugin` for AMD (from Debian contrib repository)
+- Only includes `AutoDetect=nvml` or `AutoDetect=rsmi` for plugins that are actually installed
 - `GresTypes=gpu` added to slurm.conf when any compute node has GPUs
+
+### Controller-as-Compute
+A controller can also run jobs as a compute node (common for small clusters):
+- Dedicated prompt: "Should this controller ALSO act as a compute node?" appears after UID/GID setup
+- If yes: auto-detects hardware, stores result in `CONTROLLER_NODENAME`
+- `CONTROLLER_IS_COMPUTE` flag triggers slurmd installation on controllers
+- `gather_compute_nodes()` automatically includes `CONTROLLER_NODENAME` in the node list
+- This is separate from the "Define additional compute nodes now?" prompt
+
+### Service Defaults Files
+Debian's Slurm systemd units reference `$*_OPTIONS` environment variables that cause
+warnings if undefined. The installer creates `/etc/default/{slurmd,slurmctld,slurmdbd}`:
+- `setup_service_defaults()` in common.sh creates the file if it doesn't exist
+- Called from `start_slurmd()`, `start_slurmctld()`, `start_slurmdbd()` before starting each service
+- Files are not overwritten if they already exist (preserves user customizations)
+- Users can add options like `-D -vvv` for debug mode
 
 ## Node Roles
 
