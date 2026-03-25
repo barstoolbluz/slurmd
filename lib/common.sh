@@ -507,11 +507,18 @@ show_detected_hardware() {
 # ── Utility ─────────────────────────────────────────────────────────────────
 
 # Back up a file before modifying it.
+# Uses sudo if needed for files not writable by current user.
 backup_file() {
     local file="$1"
     if [[ -f "$file" ]]; then
         local backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
-        cp -a "$file" "$backup"
+        local dir
+        dir=$(dirname "$file")
+        if [[ -w "$dir" ]]; then
+            cp -a "$file" "$backup"
+        else
+            sudo cp -a "$file" "$backup"
+        fi
         log_info "Backed up ${file} -> ${backup}"
     fi
 }

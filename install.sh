@@ -101,6 +101,103 @@ local_read_file() {
     fi
 }
 
+# Check if this machine is a Slurm controller (has slurmctld installed/configured).
+is_controller_node() {
+    # Check if slurmctld service unit file exists
+    if systemctl list-unit-files slurmctld.service 2>/dev/null | grep -q 'slurmctld\.service'; then
+        return 0
+    fi
+    return 1
+}
+
+# Add compute node definitions to an existing slurm.conf.
+# Usage: add_nodes_to_slurm_conf "NodeName=node1 CPUs=8 ..."
+# Multiple nodes can be passed as newline-separated string.
+add_nodes_to_slurm_conf() {
+    local new_nodes="$1"
+    local conf_file="/etc/slurm/slurm.conf"
+    local partition_name="${PARTITION_NAME:-batch}"
+
+    if [[ -z "$new_nodes" ]]; then
+        log_warn "No nodes to add."
+        return 1
+    fi
+
+    # Read current config
+    local conf_content
+    conf_content=$(local_read_file "$conf_file") || {
+        log_error "Could not read slurm.conf"
+        return 1
+    }
+
+    # Backup first
+    backup_file "$conf_file"
+
+    # Extract node names for partition
+    local node_names
+    node_names=$(echo "$new_nodes" | grep -oP 'NodeName=\K[^\s]+' | paste -sd',' -)
+
+    # Check if we have placeholder comments (no real nodes defined yet)
+    if echo "$conf_content" | grep -q '^# No compute nodes configured yet\.'; then
+        # Replace placeholder block with actual nodes
+        # The range matches from "# No compute nodes configured yet." to the example NodeName line
+        conf_content=$(echo "$conf_content" | sed '/^# No compute nodes configured yet\./,/^# NodeName=compute01.*State=UNKNOWN/d')
+        # Also update the commented partition line
+        conf_content=$(echo "$conf_content" | sed "s|^# PartitionName=batch Nodes=compute\[01-10\].*|PartitionName=${partition_name} Nodes=${node_names} Default=YES MaxTime=INFINITE State=UP|")
+    else
+        # Nodes already exist - combine existing node names with new ones
+        local existing_names
+        existing_names=$(echo "$conf_content" | grep -oP '^NodeName=\K[^\s]+' | paste -sd',' -)
+        local new_names
+        new_names=$(echo "$new_nodes" | grep -oP 'NodeName=\K[^\s]+' | paste -sd',' -)
+        if [[ -n "$existing_names" ]]; then
+            node_names="${existing_names},${new_names}"
+        else
+            node_names="${new_names}"
+        fi
+        # Update partition to include all nodes
+        conf_content=$(echo "$conf_content" | sed -E "s|^(PartitionName=${partition_name} Nodes=)[^ ]+|\1${node_names}|")
+    fi
+
+    # Find where to insert nodes (before partition section)
+    local temp_file
+    temp_file=$(mktemp)
+
+    # Write config with new nodes inserted
+    local nodes_written=false
+    while IFS= read -r line; do
+        # Detect start of partition section
+        if [[ "$line" =~ ^#\ ──\ Partitions ]] && ! $nodes_written; then
+            # Insert new nodes before partition section
+            echo "$new_nodes"
+            echo
+            nodes_written=true
+        fi
+        echo "$line"
+    done <<< "$conf_content" > "$temp_file"
+
+    # If nodes weren't written (no partition section marker), append them
+    if ! $nodes_written; then
+        echo "$new_nodes" >> "$temp_file"
+    fi
+
+    # Check for GPU nodes and update GresTypes if needed
+    if echo "$new_nodes" | grep -qE 'Gres=gpu'; then
+        if ! grep -q '^GresTypes=gpu' "$temp_file"; then
+            # Replace commented GresTypes line
+            sed -i 's|^# GresTypes=gpu.*|GresTypes=gpu|' "$temp_file"
+        fi
+    fi
+
+    # Move temp file to conf
+    local_sudo mv "$temp_file" "$conf_file"
+    local_sudo chown root:root "$conf_file"
+    local_sudo chmod 0644 "$conf_file"
+
+    log_success "Added $(echo "$new_nodes" | wc -l) node(s) to slurm.conf"
+    return 0
+}
+
 # Extract simple hostnames from slurm.conf NodeName entries.
 # Skips node ranges like node[01-10] and the local hostname.
 get_remote_nodes() {
@@ -638,6 +735,59 @@ setup_remote_nodes() {
 
     if [[ -z "$nodes" ]]; then
         log_warn "No remote nodes found in slurm.conf."
+
+        # Check if we're on a controller and offer to add nodes
+        if is_controller_node; then
+            echo
+            log_info "Would you like to add compute nodes now?"
+            log_info "On each compute node, run 'slurmd -C' to get the hardware line."
+            echo
+
+            if confirm "Add compute nodes to slurm.conf?" "default_yes"; then
+                # Source common.sh functions if not already loaded
+                if ! declare -f detect_local_hardware &>/dev/null; then
+                    source "${SCRIPT_DIR}/lib/common.sh"
+                fi
+
+                # Initialize variables
+                COMPUTE_NODES=""
+                CONTROLLER_IS_COMPUTE=false
+                PARTITION_NAME="batch"
+
+                gather_compute_nodes
+
+                if [[ -n "$COMPUTE_NODES" ]]; then
+                    if ! add_nodes_to_slurm_conf "$COMPUTE_NODES"; then
+                        log_error "Failed to add nodes to slurm.conf"
+                        exit 1
+                    fi
+
+                    # Reconfigure slurmctld to pick up changes
+                    log_info "Reconfiguring slurmctld..."
+                    if local_sudo scontrol reconfigure 2>/dev/null; then
+                        log_success "Controller reconfigured."
+                    fi
+
+                    # Re-fetch nodes after adding them
+                    nodes=$(get_remote_nodes)
+                else
+                    log_info "No compute nodes were added."
+                    log_info "Node ranges (e.g., node[01-10]) must be distributed manually."
+                    exit 0
+                fi
+            else
+                log_info "Node ranges (e.g., node[01-10]) must be distributed manually."
+                exit 0
+            fi
+        else
+            log_info "Node ranges (e.g., node[01-10]) must be distributed manually."
+            exit 0
+        fi
+    fi
+
+    # If we still have no nodes after potentially adding them, exit
+    if [[ -z "$nodes" ]]; then
+        log_info "No distributable nodes (simple hostnames) found."
         log_info "Node ranges (e.g., node[01-10]) must be distributed manually."
         exit 0
     fi
@@ -926,6 +1076,7 @@ gather_config() {
                 gather_compute_nodes
             else
                 COMPUTE_NODES=""
+                log_info "To add compute nodes later, run: ${CYAN}./install.sh --setup-nodes${RESET}"
             fi
 
             prompt_input "Default partition name" "batch"

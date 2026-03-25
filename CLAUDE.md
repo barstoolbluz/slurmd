@@ -73,6 +73,13 @@ Three modes supported via `SSH_MODE` global:
 - `sudo_passwordless` — user SSH + passwordless sudo
 - `sudo_password` — user SSH + sudo with password prompt (uses ssh -tt)
 
+### Adding Compute Nodes After Installation
+If compute nodes are skipped during initial setup, `--setup-nodes` can add them later:
+- `is_controller_node()` — checks if slurmctld service exists
+- `add_nodes_to_slurm_conf()` — adds NodeName lines to existing slurm.conf
+- When `--setup-nodes` finds no nodes, it offers to add them via `gather_compute_nodes()`
+- Automatically updates partition definitions and enables GresTypes if GPUs detected
+
 ### GPU Detection
 NVIDIA and AMD GPUs are auto-detected:
 - `detect_nvidia_gpus()` in common.sh sets `LOCAL_NVIDIA_GPU_COUNT` and `LOCAL_HAS_NVIDIA` via `nvidia-smi`
