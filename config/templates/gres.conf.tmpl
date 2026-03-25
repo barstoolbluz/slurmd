@@ -7,6 +7,8 @@
 # ===========================================================================
 
 # Auto-detection discovers all GPUs without manual enumeration.
-# Supports NVIDIA GPUs (via NVML) and AMD GPUs (via RSMI).
-# Requires appropriate drivers: nvidia-smi for NVIDIA, rocm-smi for AMD.
-AutoDetect=any
+# NVML detects NVIDIA GPUs (requires nvidia-smi / CUDA drivers).
+# RSMI detects AMD GPUs (requires rocm-smi / ROCm drivers).
+# Both lines are safe to include; each only activates if the respective driver is present.
+AutoDetect=nvml
+AutoDetect=rsmi
