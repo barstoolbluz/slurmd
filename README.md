@@ -122,12 +122,73 @@ Generated configs land in `/etc/slurm/`. The installer backs up any existing fil
 | cgroup.conf | `/etc/slurm/cgroup.conf` | Compute nodes |
 | munge.key | `/etc/munge/munge.key` | Must be identical on all nodes |
 
+## Security considerations
+
+### MUNGE key
+
+The MUNGE key (`/etc/munge/munge.key`) is the shared secret for cluster authentication.
+
+- **Permissions:** Must be `0400` owned by `munge:munge`
+- **Distribution:** Copy securely (scp, not unencrypted channels)
+- **Rotation:** To rotate, generate new key on controller, distribute to all nodes, restart munge everywhere simultaneously
+
+### Database password
+
+The slurmdbd password is stored in `/etc/slurm/slurmdbd.conf`:
+- **Permissions:** Must be `0600` owned by `slurm:slurm`
+- Auto-generated during installation if not specified
+- Only readable by the slurm user (slurmdbd runs as slurm)
+
+### File permissions summary
+
+| File | Permissions | Owner | Why |
+|------|-------------|-------|-----|
+| munge.key | 0400 | munge:munge | Shared secret, read-only |
+| slurm.conf | 0644 | root:root | Must be world-readable for CLI tools |
+| slurmdbd.conf | 0600 | slurm:slurm | Contains DB password |
+| cgroup.conf | 0644 | root:root | Read by slurmd |
+
 ## Requirements
 
 - Debian 11 (Bullseye), 12 (Bookworm), or 13 (Trixie)
 - Root privileges
 - Network access to Debian package repositories
 - All nodes must be able to reach each other on ports 6817-6819
+
+## UID/GID consistency
+
+**Critical:** The `slurm` user must have identical UID and GID on ALL cluster nodes.
+
+The installer uses UID/GID 64030 by default. If a node already has a `slurm` user with a different ID, you'll see:
+
+```
+[WARN] Existing UID (1001) differs from requested (64030).
+[WARN] Ensure this UID is consistent across ALL cluster nodes.
+```
+
+### Before installation
+
+Check existing slurm user on all nodes:
+```bash
+id slurm
+```
+
+If IDs differ, either:
+1. Use the existing UID/GID on all nodes (enter it during installation)
+2. Remove the slurm user and let the installer create it fresh:
+   ```bash
+   sudo userdel slurm
+   sudo groupdel slurm
+   ```
+
+### Why this matters
+
+Slurm uses UID/GID for:
+- File ownership verification across nodes
+- Job credential validation
+- Log file access
+
+Mismatched IDs cause authentication failures and permission errors.
 
 ## Ports
 
@@ -140,3 +201,201 @@ Generated configs land in `/etc/slurm/`. The installer backs up any existing fil
 ## Idempotency
 
 The installer is safe to re-run. It checks current state before acting and prompts before overwriting existing configuration files (with automatic backups).
+
+## Verifying your cluster
+
+After installation, verify each component:
+
+### Check services
+```bash
+systemctl status munge slurmctld slurmd slurmdbd mariadb
+```
+
+### Test MUNGE authentication
+```bash
+# Local test
+munge -n | unmunge
+
+# Remote test (from controller to compute node)
+munge -n | ssh compute01 'unmunge'
+```
+
+### Check cluster status
+```bash
+sinfo                    # All nodes should show 'idle'
+scontrol show nodes      # Detailed node information
+scontrol show partition  # Partition configuration
+```
+
+### Verify accounting (if using slurmdbd)
+```bash
+sacctmgr show cluster    # Cluster should be registered
+sacctmgr show account    # Default 'compute' account
+sacctmgr show assoc      # User associations
+```
+
+### Submit a test job
+```bash
+# Interactive single-node test
+srun -N1 hostname
+
+# Batch job
+sbatch --wrap="echo 'Hello from Slurm'; sleep 5"
+squeue                   # Check job status
+```
+
+### Multi-node test (if multiple compute nodes)
+```bash
+srun -N2 hostname        # Should return both hostnames
+```
+
+## Common commands
+
+### Cluster status
+| Command | Description |
+|---------|-------------|
+| `sinfo` | Node and partition status |
+| `sinfo -N -l` | Detailed node list |
+| `squeue` | Job queue |
+| `squeue -u $USER` | Your jobs only |
+| `scontrol show node <name>` | Node details |
+| `scontrol show job <id>` | Job details |
+
+### Job submission
+| Command | Description |
+|---------|-------------|
+| `srun -N1 <cmd>` | Run command on one node |
+| `srun -N2 -n4 <cmd>` | Run on 2 nodes, 4 tasks |
+| `sbatch script.sh` | Submit batch job |
+| `scancel <jobid>` | Cancel a job |
+
+### Accounting (requires slurmdbd)
+| Command | Description |
+|---------|-------------|
+| `sacctmgr show cluster` | Registered clusters |
+| `sacctmgr show account` | Accounts |
+| `sacctmgr show user` | Users |
+| `sacctmgr show assoc` | All associations |
+| `sacctmgr add user <name> account=<acct>` | Add user |
+
+### Administration
+| Command | Description |
+|---------|-------------|
+| `scontrol reconfigure` | Reload slurm.conf |
+| `scontrol update node=<n> state=resume` | Bring node online |
+| `scontrol update node=<n> state=drain reason="maintenance"` | Drain node |
+
+## Adding nodes to an existing cluster
+
+### On the new compute node:
+
+1. Run the installer and select "Compute node"
+2. Get the hardware detection line:
+   ```bash
+   slurmd -C
+   ```
+   Output example:
+   ```
+   NodeName=compute02 CPUs=16 RealMemory=64000 Sockets=1 CoresPerSocket=8 ThreadsPerCore=2 State=UNKNOWN
+   ```
+
+### On the controller:
+
+1. Add the NodeName line to `/etc/slurm/slurm.conf`
+2. Add the node to the partition (e.g., `Nodes=compute01,compute02`)
+3. Distribute the updated config:
+   ```bash
+   ./install.sh --setup-nodes
+   ```
+   Or manually copy slurm.conf to the new node.
+
+4. Reconfigure the controller:
+   ```bash
+   scontrol reconfigure
+   ```
+
+5. Verify the node appears:
+   ```bash
+   sinfo
+   ```
+
+> **Note:** Node ranges like `compute[01-10]` in slurm.conf are supported, but `--setup-nodes` can only distribute to explicitly named nodes. Ranges require manual distribution.
+
+## Controller as compute node
+
+For small clusters, the controller can also run jobs. During installation, when prompted to define compute nodes, you can include the controller itself. The installer will ask:
+
+```
+Add THIS machine (controller01) as a compute node? [y/N]
+```
+
+Answer `y` to enable this.
+
+This will:
+- Add the controller's NodeName line to slurm.conf
+- Install slurmd alongside slurmctld
+- Start both daemons
+
+The controller will appear in `sinfo` as both the controller and an available compute node.
+
+> **Caution:** For production clusters, keep controller and compute roles separate. Running jobs on the controller can impact scheduling performance.
+
+## Troubleshooting
+
+### Nodes showing as DOWN or NOT_RESPONDING
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| `down*` in sinfo | MUNGE key mismatch | Ensure identical key on all nodes, restart munge everywhere |
+| `NOT_RESPONDING` | Hostname not resolvable | Add controller to `/etc/hosts` on compute nodes |
+| Node not appearing | Not in slurm.conf | Add NodeName line, run `scontrol reconfigure` |
+
+### MUNGE authentication failures
+
+- Check key permissions: `stat /etc/munge/munge.key` (should be 0400 munge:munge)
+- Test locally: `munge -n | unmunge`
+- Test remotely: `munge -n | ssh compute01 'unmunge'`
+- Check logs: `journalctl -xeu munge`
+
+### Jobs stuck in pending
+
+- Verify user has accounting association: `sacctmgr show assoc user=$USER`
+- Check node state: `sinfo` (nodes must be `idle`, not `down` or `drain`)
+- Verify partition exists: `scontrol show partition`
+
+### Service won't start
+
+For any service (munge, slurmd, slurmctld, slurmdbd):
+```bash
+systemctl status <service>
+journalctl -xeu <service>
+```
+
+Common causes:
+- **munge**: Wrong key permissions, /etc/munge not owned by munge
+- **slurmd**: Can't reach controller, slurm.conf mismatch
+- **slurmctld**: Port 6817 in use, invalid slurm.conf syntax
+- **slurmdbd**: MariaDB not running, wrong DB password in slurmdbd.conf
+
+### Permission denied running sinfo/srun
+
+slurm.conf must be world-readable (0644). Fix:
+```bash
+sudo chmod 0644 /etc/slurm/slurm.conf
+```
+
+## Known limitations
+
+This installer provides a straightforward single-cluster setup. It does not support:
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| High availability | Not supported | Single controller only, no failover |
+| Federation | Not supported | Single cluster only |
+| Non-Debian distros | Not supported | Debian 11, 12, 13 only |
+| Node ranges in --setup-nodes | Partial | Must distribute to ranges manually |
+| Dynamic node discovery | Not supported | Nodes must be added to slurm.conf manually |
+| Encrypted communication | Not supported | MUNGE provides authentication, not encryption |
+| Shared filesystem | Not configured | No NFS/Lustre integration |
+
+For advanced configurations, refer to the [Slurm documentation](https://slurm.schedmd.com/documentation.html).
