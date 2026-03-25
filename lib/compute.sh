@@ -33,6 +33,67 @@ install_compute_packages() {
     log_success "Compute node packages installed."
 }
 
+fetch_slurm_conf_from_controller() {
+    local conf_file="/etc/slurm/slurm.conf"
+    local controller="${CONTROLLER_HOSTNAME:-}"
+
+    if [[ -z "$controller" ]]; then
+        prompt_input "Controller hostname or IP"
+        controller="$REPLY"
+    fi
+
+    local default_user
+    default_user=$(whoami)
+    prompt_input "SSH username for ${controller}" "$default_user"
+    local ssh_user="$REPLY"
+
+    local ssh_target="${ssh_user}@${controller}"
+
+    log_info "Fetching slurm.conf from ${ssh_target}..."
+    echo -e "${YELLOW}You may be prompted for your SSH password and/or sudo password.${RESET}"
+    echo
+
+    # slurm.conf is world-readable (0644) so we don't need sudo on remote
+    local tmp_conf
+    tmp_conf=$(mktemp)
+
+    if ssh -o ConnectTimeout=10 "$ssh_target" "cat /etc/slurm/slurm.conf" > "$tmp_conf" 2>/dev/null; then
+        # Verify we got something reasonable
+        if ! grep -q 'ClusterName=' "$tmp_conf"; then
+            rm -f "$tmp_conf"
+            die "Fetched file doesn't look like a valid slurm.conf"
+        fi
+
+        cp "$tmp_conf" "$conf_file"
+        rm -f "$tmp_conf"
+        log_success "slurm.conf fetched from ${controller}"
+
+        # Also fetch cgroup.conf if it exists
+        log_info "Checking for cgroup.conf on controller..."
+        if ssh -o ConnectTimeout=10 "$ssh_target" "cat /etc/slurm/cgroup.conf" > /etc/slurm/cgroup.conf 2>/dev/null; then
+            chown root:root /etc/slurm/cgroup.conf
+            chmod 0644 /etc/slurm/cgroup.conf
+            log_success "cgroup.conf also fetched."
+        fi
+
+        # Also fetch gres.conf if it exists
+        if ssh -o ConnectTimeout=10 "$ssh_target" "cat /etc/slurm/gres.conf" > /tmp/gres.conf 2>/dev/null; then
+            if [[ -s /tmp/gres.conf ]]; then
+                mv /tmp/gres.conf /etc/slurm/gres.conf
+                chown root:root /etc/slurm/gres.conf
+                chmod 0644 /etc/slurm/gres.conf
+                log_success "gres.conf also fetched."
+            fi
+        fi
+        rm -f /tmp/gres.conf
+    else
+        rm -f "$tmp_conf"
+        log_error "Failed to fetch slurm.conf from ${controller}."
+        log_info "Ensure you can SSH to the controller: ssh ${ssh_target}"
+        die "Could not retrieve slurm.conf."
+    fi
+}
+
 setup_slurm_conf_compute() {
     log_step "Setting up slurm.conf on compute node"
 
@@ -48,18 +109,23 @@ setup_slurm_conf_compute() {
 
     echo
     echo -e "The compute node needs the ${BOLD}same slurm.conf${RESET} as the controller."
-    echo -e "You can provide it in one of two ways:"
-    echo -e "  ${CYAN}1)${RESET} Specify a path to a slurm.conf file (copied from the controller)"
-    echo -e "  ${CYAN}2)${RESET} Generate one now (you must provide the same values as the controller)"
+    echo -e "How would you like to provide it?"
+    echo -e "  ${CYAN}1)${RESET} Fetch from controller via SSH (recommended)"
+    echo -e "  ${CYAN}2)${RESET} Specify a path to a local slurm.conf file"
+    echo -e "  ${CYAN}3)${RESET} Generate from scratch (must match controller values exactly)"
     echo
 
-    menu_select "How would you like to provide slurm.conf?" \
-        "Path to existing slurm.conf" \
+    menu_select "Choose an option:" \
+        "Fetch from controller via SSH (recommended)" \
+        "Path to local slurm.conf file" \
         "Generate from scratch"
     local method="$REPLY"
 
     case "$method" in
         1)
+            fetch_slurm_conf_from_controller
+            ;;
+        2)
             prompt_input "Path to slurm.conf"
             local src_path="$REPLY"
 
@@ -70,7 +136,7 @@ setup_slurm_conf_compute() {
             cp "$src_path" "$conf_file"
             log_success "slurm.conf copied from ${src_path}."
             ;;
-        2)
+        3)
             generate_slurm_conf_interactive
             ;;
     esac
