@@ -286,10 +286,14 @@ update_node_config() {
 
     # Use awk for replacement - safer than sed with special characters
     # Exact match on first field avoids regex issues with dots in FQDNs
+    # Use tee for sudo-aware write, then restore correct permissions
     local_sudo awk -v target="NodeName=${nodename}" -v newline="$new_line" '
         $1 == target { print newline; next }
         { print }
-    ' "$conf_file" > "${conf_file}.tmp" && local_sudo mv "${conf_file}.tmp" "$conf_file"
+    ' "$conf_file" | local_sudo tee "${conf_file}.tmp" >/dev/null
+    local_sudo mv "${conf_file}.tmp" "$conf_file"
+    local_sudo chmod 0644 "$conf_file"
+    local_sudo chown root:root "$conf_file"
 
     log_success "Updated ${nodename} in slurm.conf"
 }
