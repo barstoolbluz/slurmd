@@ -14,7 +14,7 @@ The installer walks you through selecting a node role and configuring the cluste
 
 | Option | Description |
 |--------|-------------|
-| `--setup-nodes` | Distribute configs (munge.key, slurm.conf, cgroup.conf, gres.conf) to remote nodes via SSH |
+| `--setup-nodes` | Distribute configs (munge.key, slurm.conf, cgroup.conf) to remote nodes via SSH |
 | `--uninstall` | Remove Slurm and MUNGE packages, with options to clean configs and state |
 | `--help` | Show usage information |
 
@@ -36,7 +36,7 @@ The installer walks you through selecting a node role and configuring the cluste
 2. **Compute nodes** — run `slurmd -C` on each to get hardware lines, add them to slurm.conf on the controller
 3. **Distribute configs** to all nodes (choose one method):
    - **Automatic:** `./install.sh --setup-nodes` (requires SSH key auth)
-   - **Manual:** Copy `/etc/munge/munge.key`, `/etc/slurm/slurm.conf`, `/etc/slurm/cgroup.conf`, and `/etc/slurm/gres.conf` (if present) to each node
+   - **Manual:** Copy `/etc/munge/munge.key`, `/etc/slurm/slurm.conf`, and `/etc/slurm/cgroup.conf` to each node (gres.conf is generated locally on each node)
 4. **Database node** (if separate from controller) — run installer before distributing configs
 5. **Login nodes** — run installer, then distribute configs
 6. On the controller: `scontrol reconfigure` to apply changes
@@ -53,10 +53,13 @@ After setting up the controller, use `--setup-nodes` to automatically distribute
 
 This will:
 - Read node definitions from `/etc/slurm/slurm.conf`
-- Copy munge.key, slurm.conf, cgroup.conf, and gres.conf (if present) to each node
+- Optionally review/update existing node configurations (fetch hardware via SSH)
+- Copy munge.key, slurm.conf, and cgroup.conf to each node
 - Restart munge and slurmd on remote nodes
 - Verify munge authentication to each node
 - Run `scontrol reconfigure` on the controller
+
+> **Note:** gres.conf is NOT distributed. Each node generates its own gres.conf based on locally installed GPU plugins (`slurm-wlm-nvml-plugin` for NVIDIA, `slurm-wlm-rsmi-plugin` for AMD).
 
 **Requirements:**
 - SSH key-based authentication to all nodes
@@ -97,7 +100,6 @@ config/
     slurm.conf.tmpl     slurm.conf template
     slurmdbd.conf.tmpl  slurmdbd.conf template
     cgroup.conf.tmpl    cgroup.conf template
-    gres.conf.tmpl      gres.conf template (GPU support)
     mariadb-container.service.tmpl  systemd unit for containerized MariaDB
 ```
 
@@ -180,7 +182,7 @@ Generated configs land in `/etc/slurm/`. The installer backs up any existing fil
 | slurm.conf | `/etc/slurm/slurm.conf` | Must be identical on all nodes |
 | slurmdbd.conf | `/etc/slurm/slurmdbd.conf` | Database node only, mode 0600 |
 | cgroup.conf | `/etc/slurm/cgroup.conf` | Compute nodes |
-| gres.conf | `/etc/slurm/gres.conf` | GPU nodes only, auto-generated when NVIDIA or AMD GPUs detected |
+| gres.conf | `/etc/slurm/gres.conf` | GPU nodes only, generated locally based on installed GPU plugin type |
 | munge.key | `/etc/munge/munge.key` | Must be identical on all nodes |
 
 ## Security considerations
@@ -385,18 +387,18 @@ srun -N2 hostname        # Should return both hostnames
 
 ## Controller as compute node
 
-For small clusters, the controller can also run jobs. During installation, when prompted to define compute nodes, you can include the controller itself. The installer will ask:
+For small clusters or testing, the controller can also run jobs. During controller setup, a dedicated prompt appears:
 
 ```
-Add THIS machine (controller01) as a compute node? [y/N]
+Should this controller ALSO act as a compute node? [y/N]
 ```
 
-Answer `y` to enable this.
+If you answer `y`:
+- Hardware is auto-detected and a NodeName line is generated
+- slurmd is installed alongside slurmctld
+- The controller is added to the compute node list
 
-This will:
-- Add the controller's NodeName line to slurm.conf
-- Install slurmd alongside slurmctld
-- Start both daemons
+After this, you'll be asked about *additional* compute nodes separately.
 
 The controller will appear in `sinfo` as both the controller and an available compute node.
 
@@ -409,14 +411,22 @@ The installer automatically detects NVIDIA and AMD GPUs and configures Slurm for
 ### How it works
 
 1. During hardware detection, `nvidia-smi` and `rocm-smi` are queried to count GPUs
-2. If GPUs are found, `Gres=gpu:N` is added to the NodeName line (total of all GPUs)
-3. On GPU nodes, `/etc/slurm/gres.conf` is generated with `AutoDetect=any`
-4. When any compute node has GPUs, `GresTypes=gpu` is enabled in slurm.conf
+2. If GPUs are found, `Gres=gpu:N` is added to the NodeName line
+3. The appropriate GPU plugin is installed from Debian contrib:
+   - `slurm-wlm-nvml-plugin` for NVIDIA GPUs
+   - `slurm-wlm-rsmi-plugin` for AMD GPUs
+4. On GPU nodes, `/etc/slurm/gres.conf` is generated with the correct AutoDetect:
+   - `AutoDetect=nvml` for NVIDIA
+   - `AutoDetect=rsmi` for AMD
+5. When any compute node has GPUs, `GresTypes=gpu` is enabled in slurm.conf
+
+> **Important:** gres.conf is node-specific and must NOT be copied between nodes with different GPU types.
 
 ### Requirements
 
 - **NVIDIA:** NVIDIA drivers installed and working (`nvidia-smi` must be functional)
 - **AMD:** ROCm drivers installed and working (`rocm-smi` must be functional)
+- Debian contrib repository enabled (for GPU plugin packages)
 - No manual GPU configuration needed — auto-detection handles all GPUs
 
 ### Verifying GPU configuration
@@ -463,6 +473,23 @@ The installer handles mixed clusters automatically:
 | `down*` in sinfo | MUNGE key mismatch | Ensure identical key on all nodes, restart munge everywhere |
 | `NOT_RESPONDING` | Hostname not resolvable | Add controller to `/etc/hosts` on compute nodes |
 | Node not appearing | Not in slurm.conf | Add NodeName line, run `scontrol reconfigure` |
+
+### Nodes stuck in DRAIN or INVALID state
+
+After fixing configuration issues (e.g., gres.conf mismatch), nodes may remain in `drain` or `inval` state:
+
+```bash
+# Check why node is in current state
+scontrol show node <nodename>   # Look at "Reason" field
+
+# Clear drain state and return to idle
+sudo scontrol update nodename=<nodename> state=idle
+```
+
+Common causes of INVALID state:
+- GPU count mismatch between slurm.conf and actual hardware
+- Wrong gres.conf (e.g., `AutoDetect=rsmi` on an NVIDIA node)
+- Hardware changed since node was configured
 
 ### MUNGE authentication failures
 
@@ -526,7 +553,7 @@ sudo chmod 0644 /etc/slurm/slurm.conf
 |---------|--------------|-----|
 | `srun --gres=gpu:1` fails immediately | `GresTypes=gpu` not in slurm.conf | Add `GresTypes=gpu` to slurm.conf, run `scontrol reconfigure` |
 | GPUs not showing in `sinfo -o "%G"` | Node missing `Gres=gpu:N` | Add `Gres=gpu:N` to NodeName line in slurm.conf |
-| Job runs but GPUs not visible | Missing gres.conf | Create `/etc/slurm/gres.conf` with `AutoDetect=any` |
+| Job runs but GPUs not visible | Missing or wrong gres.conf | Create `/etc/slurm/gres.conf` with `AutoDetect=nvml` (NVIDIA) or `AutoDetect=rsmi` (AMD) |
 | `nvidia-smi`/`rocm-smi` works but Slurm doesn't see GPUs | Auto-detection failed | Check that the tool runs as slurm user: `sudo -u slurm nvidia-smi` |
 
 ## Known limitations
