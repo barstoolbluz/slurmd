@@ -508,12 +508,9 @@ distribute_to_node_sudo_password() {
     local ssh_socket="${local_tmp}/ssh-socket"
     local ssh_opts="-o ControlMaster=auto -o ControlPath=${ssh_socket} -o ControlPersist=60"
 
-    # Cleanup function to close SSH connection and remove temp files
-    cleanup_ssh() {
-        ssh -q -o ControlPath="${ssh_socket}" -O exit "$ssh_target" 2>/dev/null || true
-        rm -rf "$local_tmp"
-    }
-    trap cleanup_ssh RETURN
+    # Cleanup: close SSH connection and remove temp files
+    # Note: variables are expanded now (at trap setup time) to avoid scope issues
+    trap "ssh -q -o ControlPath='${ssh_socket}' -O exit '${ssh_target}' 2>/dev/null || true; rm -rf '${local_tmp}'" RETURN
 
     # Read files locally (may need sudo)
     local_read_file /etc/munge/munge.key > "${local_tmp}/munge.key" || {
