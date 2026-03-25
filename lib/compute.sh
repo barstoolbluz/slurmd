@@ -112,12 +112,14 @@ setup_slurm_conf_compute() {
     echo -e "How would you like to provide it?"
     echo -e "  ${CYAN}1)${RESET} Fetch from controller via SSH (recommended)"
     echo -e "  ${CYAN}2)${RESET} Specify a path to a local slurm.conf file"
-    echo -e "  ${CYAN}3)${RESET} Generate from scratch (must match controller values exactly)"
+    echo -e "  ${CYAN}3)${RESET} Skip — will be pushed from controller via --setup-nodes"
+    echo -e "  ${CYAN}4)${RESET} Generate from scratch (must match controller values exactly)"
     echo
 
     menu_select "Choose an option:" \
         "Fetch from controller via SSH (recommended)" \
         "Path to local slurm.conf file" \
+        "Skip — will be pushed from controller" \
         "Generate from scratch"
     local method="$REPLY"
 
@@ -137,6 +139,12 @@ setup_slurm_conf_compute() {
             log_success "slurm.conf copied from ${src_path}."
             ;;
         3)
+            log_info "Skipping slurm.conf setup."
+            log_info "Run ${CYAN}./install.sh --setup-nodes${RESET} on the controller to push configs."
+            SLURM_CONF_SKIPPED=true
+            return 0
+            ;;
+        4)
             generate_slurm_conf_interactive
             ;;
     esac
@@ -292,6 +300,15 @@ setup_compute() {
     show_compute_hardware_early
     install_compute_packages
     setup_slurm_conf_compute
+
+    # If user chose to skip config (will be pushed from controller), don't start slurmd yet
+    if [[ "${SLURM_CONF_SKIPPED:-false}" == "true" ]]; then
+        log_info "slurmd will not be started until configs are pushed from the controller."
+        log_info "After running --setup-nodes on the controller, start slurmd with:"
+        echo -e "    ${CYAN}sudo systemctl start slurmd${RESET}"
+        return 0
+    fi
+
     setup_cgroup_conf_compute
     setup_gres_conf_compute
     detect_hardware
