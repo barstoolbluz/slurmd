@@ -70,11 +70,15 @@ fetch_slurm_conf_from_controller() {
 
         # Also fetch cgroup.conf if it exists
         log_info "Checking for cgroup.conf on controller..."
-        if ssh -o ConnectTimeout=10 "$ssh_target" "cat /etc/slurm/cgroup.conf" > /etc/slurm/cgroup.conf 2>/dev/null; then
-            chown root:root /etc/slurm/cgroup.conf
-            chmod 0644 /etc/slurm/cgroup.conf
-            log_success "cgroup.conf also fetched."
+        if ssh -o ConnectTimeout=10 "$ssh_target" "cat /etc/slurm/cgroup.conf" > /tmp/cgroup.conf 2>/dev/null; then
+            if [[ -s /tmp/cgroup.conf ]]; then
+                mv /tmp/cgroup.conf /etc/slurm/cgroup.conf
+                chown root:root /etc/slurm/cgroup.conf
+                chmod 0644 /etc/slurm/cgroup.conf
+                log_success "cgroup.conf also fetched."
+            fi
         fi
+        rm -f /tmp/cgroup.conf
 
         # Also fetch gres.conf if it exists
         if ssh -o ConnectTimeout=10 "$ssh_target" "cat /etc/slurm/gres.conf" > /tmp/gres.conf 2>/dev/null; then
