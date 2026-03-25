@@ -527,32 +527,33 @@ distribute_to_node_sudo_password() {
         }
     fi
 
-    # Create temp directory on remote
-    if ! ssh -q -o BatchMode=yes "$ssh_target" "mkdir -p ${tmp_dir}" 2>/dev/null; then
+    # Create temp directory on remote (may prompt for password)
+    log_info "  Connecting to ${node} (you may be prompted for your password)..."
+    if ! ssh -q "$ssh_target" "mkdir -p ${tmp_dir}"; then
         log_error "  Failed to create temp directory on ${node}"
         return 1
     fi
 
     # Copy files to temp location on remote
-    if ! scp -q -o BatchMode=yes "${local_tmp}/munge.key" "${ssh_target}:${tmp_dir}/munge.key" 2>/dev/null; then
+    if ! scp -q "${local_tmp}/munge.key" "${ssh_target}:${tmp_dir}/munge.key"; then
         log_error "  Failed to copy munge.key to ${node}"
         failed=true
     fi
 
-    if ! scp -q -o BatchMode=yes "${local_tmp}/slurm.conf" "${ssh_target}:${tmp_dir}/slurm.conf" 2>/dev/null; then
+    if ! scp -q "${local_tmp}/slurm.conf" "${ssh_target}:${tmp_dir}/slurm.conf"; then
         log_error "  Failed to copy slurm.conf to ${node}"
         failed=true
     fi
 
     if [[ -f "${local_tmp}/cgroup.conf" ]]; then
-        if ! scp -q -o BatchMode=yes "${local_tmp}/cgroup.conf" "${ssh_target}:${tmp_dir}/cgroup.conf" 2>/dev/null; then
+        if ! scp -q "${local_tmp}/cgroup.conf" "${ssh_target}:${tmp_dir}/cgroup.conf"; then
             log_error "  Failed to copy cgroup.conf to ${node}"
             failed=true
         fi
     fi
 
     if [[ -f "${local_tmp}/gres.conf" ]]; then
-        if ! scp -q -o BatchMode=yes "${local_tmp}/gres.conf" "${ssh_target}:${tmp_dir}/gres.conf" 2>/dev/null; then
+        if ! scp -q "${local_tmp}/gres.conf" "${ssh_target}:${tmp_dir}/gres.conf"; then
             log_error "  Failed to copy gres.conf to ${node}"
             failed=true
         fi
@@ -601,10 +602,10 @@ rm -rf ${tmp_dir}
 sudo systemctl restart munge
 sudo systemctl restart slurmd 2>/dev/null || true"
 
-    if ! echo "$script_content" | ssh -q -o BatchMode=yes "$ssh_target" "cat > ${remote_script} && chmod +x ${remote_script}"; then
+    if ! echo "$script_content" | ssh -q "$ssh_target" "cat > ${remote_script} && chmod +x ${remote_script}"; then
         log_error "  Failed to create install script on ${node}"
         failed=true
-        ssh -q -o BatchMode=yes "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
+        ssh -q "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
         return 1
     fi
 
@@ -612,7 +613,7 @@ sudo systemctl restart slurmd 2>/dev/null || true"
     if ! ssh -tt "$ssh_target" "${remote_script}" </dev/tty; then
         log_error "  Failed to install files on ${node}"
         failed=true
-        ssh -q -o BatchMode=yes "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
+        ssh -q "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
     fi
 
     $failed && return 1
