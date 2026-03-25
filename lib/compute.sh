@@ -222,16 +222,11 @@ setup_cgroup_conf_compute() {
 }
 
 # Set up gres.conf for GPU support on compute nodes.
-# Only creates gres.conf if GPUs (NVIDIA or AMD) are detected.
+# Always creates gres.conf with AutoDetect=any so GPUs are discovered at slurmd startup.
+# This handles cases where GPU drivers aren't installed at installer time but added later.
 setup_gres_conf_compute() {
     local conf_file="/etc/slurm/gres.conf"
     local template="${SCRIPT_DIR}/config/templates/gres.conf.tmpl"
-
-    # Only needed if this node has GPUs
-    if [[ "${LOCAL_GPU_COUNT:-0}" -eq 0 ]]; then
-        log_info "No GPUs detected — skipping gres.conf."
-        return 0
-    fi
 
     if [[ -f "$conf_file" ]]; then
         log_info "gres.conf already exists, keeping it."
@@ -247,7 +242,11 @@ setup_gres_conf_compute() {
     chown root:root "$conf_file"
     chmod 0644 "$conf_file"
 
-    log_success "gres.conf written to ${conf_file} (${LOCAL_GPU_COUNT} GPU(s) detected)."
+    if [[ "${LOCAL_GPU_COUNT:-0}" -gt 0 ]]; then
+        log_success "gres.conf written to ${conf_file} (${LOCAL_GPU_COUNT} GPU(s) detected)."
+    else
+        log_info "gres.conf written to ${conf_file} (AutoDetect will find GPUs at slurmd startup)."
+    fi
 }
 
 detect_hardware() {
@@ -267,9 +266,10 @@ detect_hardware() {
             # Compare with earlier /proc-based detection if available
             if [[ -n "${LOCAL_CPUS:-}" ]]; then
                 # Extract values from slurmd output
-                local slurmd_cpus slurmd_mem
+                local slurmd_cpus slurmd_mem slurmd_gres
                 slurmd_cpus=$(echo "$hw_line" | grep -oP 'CPUs=\K[0-9]+' || echo "")
                 slurmd_mem=$(echo "$hw_line" | grep -oP 'RealMemory=\K[0-9]+' || echo "")
+                slurmd_gres=$(echo "$hw_line" | grep -oP 'Gres=\K[^ ]+' || echo "")
 
                 if [[ -n "$slurmd_cpus" && "$slurmd_cpus" != "$LOCAL_CPUS" ]]; then
                     log_info "Note: slurmd detected ${slurmd_cpus} CPUs (earlier estimate: ${LOCAL_CPUS})"
@@ -278,6 +278,18 @@ detect_hardware() {
                 if [[ -n "$slurmd_mem" && "$slurmd_mem" != "$LOCAL_MEMORY_MB" ]]; then
                     log_info "Note: slurmd detected ${slurmd_mem} MB RAM (earlier estimate: ${LOCAL_MEMORY_MB} MB)"
                     log_info "The slurmd value accounts for reserved memory."
+                fi
+
+                # Check for GPU detection issues
+                local slurmd_gpu_count=0
+                if [[ -n "$slurmd_gres" ]]; then
+                    slurmd_gpu_count=$(echo "$slurmd_gres" | grep -oP 'gpu:?\K[0-9]+' || echo "0")
+                fi
+                if [[ "${LOCAL_GPU_COUNT:-0}" -gt 0 && "$slurmd_gpu_count" -eq 0 ]]; then
+                    log_warn "GPUs detected at install time but slurmd reports 0 GPUs."
+                    log_warn "Ensure /etc/slurm/gres.conf exists and NVIDIA/AMD drivers are installed."
+                elif [[ "${LOCAL_GPU_COUNT:-0}" -eq 0 && "$slurmd_gpu_count" -gt 0 ]]; then
+                    log_info "slurmd detected ${slurmd_gpu_count} GPU(s) via gres.conf AutoDetect."
                 fi
             fi
 
