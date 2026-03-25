@@ -710,6 +710,18 @@ uninstall_slurm() {
         fi
     fi
 
+    # Clean up orphaned MySQL/MariaDB directories (from manual or incomplete uninstalls)
+    if ! $we_installed_mariadb && [[ -d /etc/mysql ]]; then
+        if ! dpkg -l mariadb-server 2>/dev/null | grep -q '^ii' && \
+           ! dpkg -l mysql-server 2>/dev/null | grep -q '^ii'; then
+            log_warn "Found orphaned /etc/mysql directory (no MariaDB/MySQL installed)."
+            if confirm "Remove orphaned /etc/mysql directory?" "default_yes"; then
+                rm -rf /etc/mysql /var/lib/mysql
+                log_success "Orphaned MySQL directories removed."
+            fi
+        fi
+    fi
+
     # Chrony (only if we installed it)
     if $we_installed_chrony; then
         if confirm "Remove chrony (installed by this installer)?" "default_no"; then
