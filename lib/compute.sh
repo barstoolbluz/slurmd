@@ -100,16 +100,8 @@ fetch_slurm_conf_from_controller() {
         fi
         rm -f /tmp/cgroup.conf
 
-        # Also fetch gres.conf if it exists
-        if ssh -o ConnectTimeout=10 "$ssh_target" "cat /etc/slurm/gres.conf" > /tmp/gres.conf 2>/dev/null; then
-            if [[ -s /tmp/gres.conf ]]; then
-                mv /tmp/gres.conf /etc/slurm/gres.conf
-                chown root:root /etc/slurm/gres.conf
-                chmod 0644 /etc/slurm/gres.conf
-                log_success "gres.conf also fetched."
-            fi
-        fi
-        rm -f /tmp/gres.conf
+        # NOTE: gres.conf is NOT fetched - it's node-specific (GPU type varies)
+        # setup_gres_conf_compute() will generate the correct local gres.conf
     else
         rm -f "$tmp_conf"
         log_error "Failed to fetch slurm.conf from ${controller}."
