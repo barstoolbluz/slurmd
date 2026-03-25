@@ -10,6 +10,14 @@ sudo ./install.sh
 
 The installer walks you through selecting a node role and configuring the cluster. No flags or config files needed upfront.
 
+## Command-line options
+
+| Option | Description |
+|--------|-------------|
+| `--setup-nodes` | Distribute configs (munge.key, slurm.conf, cgroup.conf) to remote nodes via SSH |
+| `--uninstall` | Remove Slurm and MUNGE packages, with options to clean configs and state |
+| `--help` | Show usage information |
+
 ## Supported node roles
 
 | Role | What it installs | Daemons |
@@ -23,13 +31,47 @@ The installer walks you through selecting a node role and configuring the cluste
 ## Cluster setup order
 
 1. **Controller (+ Database)** first — generates the MUNGE key and slurm.conf
-2. Copy `/etc/munge/munge.key` and `/etc/slurm/slurm.conf` to all other nodes
-3. **Database node** (if separate from controller)
-4. **Compute nodes** — run `slurmd -C` on each to get hardware lines for slurm.conf
-5. **Login nodes**
-6. On the controller: add compute NodeName lines to slurm.conf, then `scontrol reconfigure`
+2. **Compute nodes** — run `slurmd -C` on each to get hardware lines, add them to slurm.conf on the controller
+3. **Distribute configs** to all nodes (choose one method):
+   - **Automatic:** `./install.sh --setup-nodes` (requires SSH key auth)
+   - **Manual:** Copy `/etc/munge/munge.key`, `/etc/slurm/slurm.conf`, and `/etc/slurm/cgroup.conf` to each node
+4. **Database node** (if separate from controller) — run installer before distributing configs
+5. **Login nodes** — run installer, then distribute configs
+6. On the controller: `scontrol reconfigure` to apply changes
 
 > **Note:** Debian's munge package automatically generates a key during installation if none exists. The installer detects this and prompts before overwriting. On the controller, you typically want to generate a fresh key; on other nodes, you'll import the controller's key.
+
+## Distributing configs with --setup-nodes
+
+After setting up the controller, use `--setup-nodes` to automatically distribute configuration files to all compute and login nodes defined in slurm.conf:
+
+```bash
+./install.sh --setup-nodes
+```
+
+This will:
+- Read node definitions from `/etc/slurm/slurm.conf`
+- Copy munge.key, slurm.conf, and cgroup.conf to each node
+- Restart munge and slurmd on remote nodes
+- Verify munge authentication to each node
+- Run `scontrol reconfigure` on the controller
+
+**Requirements:**
+- SSH key-based authentication to all nodes
+- One of: root SSH access, passwordless sudo, or sudo with password prompt
+
+## Uninstalling
+
+To completely remove Slurm and MUNGE from a node:
+
+```bash
+sudo ./install.sh --uninstall
+```
+
+You'll be prompted to optionally remove:
+- Configuration files (`/etc/slurm`, `/etc/munge`)
+- State and log directories (`/var/lib/slurm`, `/var/log/slurm`, `/var/spool/slurm`)
+- Slurm database from MariaDB (if applicable)
 
 ## Repository layout
 
@@ -63,6 +105,11 @@ For every role:
 - Generates configuration files from templates
 - Starts and enables systemd services
 - Runs verification checks
+
+For controller roles with accounting:
+- Registers the cluster in the accounting database
+- Creates a default "compute" account
+- Optionally adds system users to Slurm accounting (enables job submission)
 
 ## Configuration files
 

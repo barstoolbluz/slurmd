@@ -49,8 +49,8 @@ setup_slurm_conf_login() {
             ;;
     esac
 
-    chown root:slurm "$conf_file"
-    chmod 0640 "$conf_file"
+    chown root:root "$conf_file"
+    chmod 0644 "$conf_file"
 }
 
 generate_slurm_conf_login() {
