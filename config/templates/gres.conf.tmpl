@@ -6,6 +6,7 @@
 # This file configures GPU and other accelerator resources for Slurm.
 # ===========================================================================
 
-# NVML auto-detection discovers all NVIDIA GPUs without manual enumeration.
-# Requires nvidia-smi and the NVIDIA driver to be installed.
-AutoDetect=nvml
+# Auto-detection discovers all GPUs without manual enumeration.
+# Supports NVIDIA GPUs (via NVML) and AMD GPUs (via RSMI).
+# Requires appropriate drivers: nvidia-smi for NVIDIA, rocm-smi for AMD.
+AutoDetect=any

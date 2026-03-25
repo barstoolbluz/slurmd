@@ -58,11 +58,12 @@ Three modes supported via `SSH_MODE` global:
 - `sudo_password` — user SSH + sudo with password prompt (uses ssh -tt)
 
 ### GPU Detection
-NVIDIA GPUs are auto-detected via `nvidia-smi`:
-- `detect_nvidia_gpus()` in common.sh sets `LOCAL_GPU_COUNT` and `LOCAL_HAS_NVIDIA`
-- Called automatically by `detect_local_hardware()`
-- `format_nodename_line()` adds `Gres=gpu:N` when GPUs detected
-- `generate_gres_conf()` / `setup_gres_conf_compute()` create gres.conf with `AutoDetect=nvml`
+NVIDIA and AMD GPUs are auto-detected:
+- `detect_nvidia_gpus()` in common.sh sets `LOCAL_NVIDIA_GPU_COUNT` and `LOCAL_HAS_NVIDIA` via `nvidia-smi`
+- `detect_amd_gpus()` in common.sh sets `LOCAL_AMD_GPU_COUNT` and `LOCAL_HAS_AMD` via `rocm-smi`
+- Both called automatically by `detect_local_hardware()`, which computes `LOCAL_GPU_COUNT` as the total
+- `format_nodename_line()` adds `Gres=gpu:N` when any GPUs detected (combined count)
+- `generate_gres_conf()` / `setup_gres_conf_compute()` create gres.conf with `AutoDetect=any`
 - `GresTypes=gpu` added to slurm.conf when any compute node has GPUs
 
 ## Node Roles

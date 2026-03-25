@@ -125,7 +125,7 @@ Generated configs land in `/etc/slurm/`. The installer backs up any existing fil
 | slurm.conf | `/etc/slurm/slurm.conf` | Must be identical on all nodes |
 | slurmdbd.conf | `/etc/slurm/slurmdbd.conf` | Database node only, mode 0600 |
 | cgroup.conf | `/etc/slurm/cgroup.conf` | Compute nodes |
-| gres.conf | `/etc/slurm/gres.conf` | GPU nodes only, auto-generated when NVIDIA GPUs detected |
+| gres.conf | `/etc/slurm/gres.conf` | GPU nodes only, auto-generated when NVIDIA or AMD GPUs detected |
 | munge.key | `/etc/munge/munge.key` | Must be identical on all nodes |
 
 ## Security considerations
@@ -349,25 +349,27 @@ The controller will appear in `sinfo` as both the controller and an available co
 
 ## GPU support
 
-The installer automatically detects NVIDIA GPUs and configures Slurm for GPU scheduling.
+The installer automatically detects NVIDIA and AMD GPUs and configures Slurm for GPU scheduling.
 
 ### How it works
 
-1. During hardware detection, `nvidia-smi` is queried to count GPUs
-2. If GPUs are found, `Gres=gpu:N` is added to the NodeName line
-3. On GPU nodes, `/etc/slurm/gres.conf` is generated with `AutoDetect=nvml`
+1. During hardware detection, `nvidia-smi` and `rocm-smi` are queried to count GPUs
+2. If GPUs are found, `Gres=gpu:N` is added to the NodeName line (total of all GPUs)
+3. On GPU nodes, `/etc/slurm/gres.conf` is generated with `AutoDetect=any`
 4. When any compute node has GPUs, `GresTypes=gpu` is enabled in slurm.conf
 
 ### Requirements
 
-- NVIDIA drivers installed and working (`nvidia-smi` must be functional)
-- No manual GPU configuration needed — NVML auto-detects all GPUs
+- **NVIDIA:** NVIDIA drivers installed and working (`nvidia-smi` must be functional)
+- **AMD:** ROCm drivers installed and working (`rocm-smi` must be functional)
+- No manual GPU configuration needed — auto-detection handles all GPUs
 
 ### Verifying GPU configuration
 
 ```bash
 # Check if GPUs are detected
-nvidia-smi
+nvidia-smi       # NVIDIA
+rocm-smi --showid  # AMD
 
 # View GRES in slurm.conf
 grep -E 'GresTypes|Gres=' /etc/slurm/slurm.conf
@@ -447,8 +449,8 @@ sudo chmod 0644 /etc/slurm/slurm.conf
 |---------|--------------|-----|
 | `srun --gres=gpu:1` fails immediately | `GresTypes=gpu` not in slurm.conf | Add `GresTypes=gpu` to slurm.conf, run `scontrol reconfigure` |
 | GPUs not showing in `sinfo -o "%G"` | Node missing `Gres=gpu:N` | Add `Gres=gpu:N` to NodeName line in slurm.conf |
-| Job runs but `nvidia-smi` shows no GPUs | Missing gres.conf | Create `/etc/slurm/gres.conf` with `AutoDetect=nvml` |
-| `nvidia-smi` works but Slurm doesn't see GPUs | NVML detection failed | Check that nvidia-smi runs as slurm user: `sudo -u slurm nvidia-smi` |
+| Job runs but GPUs not visible | Missing gres.conf | Create `/etc/slurm/gres.conf` with `AutoDetect=any` |
+| `nvidia-smi`/`rocm-smi` works but Slurm doesn't see GPUs | Auto-detection failed | Check that the tool runs as slurm user: `sudo -u slurm nvidia-smi` |
 
 ## Known limitations
 
@@ -457,7 +459,8 @@ This installer provides a straightforward single-cluster setup. Feature support:
 | Feature | Status | Notes |
 |---------|--------|-------|
 | NVIDIA GPU scheduling | Supported | Auto-detected via nvidia-smi, uses NVML |
-| AMD/Intel GPUs | Not supported | Only NVIDIA GPUs with nvidia-smi |
+| AMD GPU scheduling | Supported | Auto-detected via rocm-smi, uses RSMI |
+| Intel GPUs | Not supported | No auto-detection support |
 | High availability | Not supported | Single controller only, no failover |
 | Federation | Not supported | Single cluster only |
 | Non-Debian distros | Not supported | Debian 11, 12, 13 only |

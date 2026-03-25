@@ -397,17 +397,21 @@ detect_local_hardware() {
         log_warn "Container detected — hardware values may reflect the host system."
     fi
 
-    # Detect NVIDIA GPUs (optional - does not fail overall detection)
+    # Detect GPUs (optional - does not fail overall detection)
     detect_nvidia_gpus || true
+    detect_amd_gpus || true
+
+    # Compute total GPU count
+    LOCAL_GPU_COUNT=$(( ${LOCAL_NVIDIA_GPU_COUNT:-0} + ${LOCAL_AMD_GPU_COUNT:-0} ))
 
     return 0
 }
 
 # Detect NVIDIA GPUs on the local system.
-# Sets: LOCAL_GPU_COUNT, LOCAL_HAS_NVIDIA
+# Sets: LOCAL_NVIDIA_GPU_COUNT, LOCAL_HAS_NVIDIA
 # Returns 0 if GPUs found, 1 otherwise (not a failure - just no GPUs).
 detect_nvidia_gpus() {
-    LOCAL_GPU_COUNT=0
+    LOCAL_NVIDIA_GPU_COUNT=0
     LOCAL_HAS_NVIDIA=false
 
     if ! command -v nvidia-smi &>/dev/null; then
@@ -418,8 +422,31 @@ detect_nvidia_gpus() {
     count=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits 2>/dev/null | head -1)
 
     if [[ -n "$count" && "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
-        LOCAL_GPU_COUNT="$count"
+        LOCAL_NVIDIA_GPU_COUNT="$count"
         LOCAL_HAS_NVIDIA=true
+        return 0
+    fi
+    return 1
+}
+
+# Detect AMD GPUs on the local system.
+# Sets: LOCAL_AMD_GPU_COUNT, LOCAL_HAS_AMD
+# Returns 0 if GPUs found, 1 otherwise (not a failure - just no GPUs).
+detect_amd_gpus() {
+    LOCAL_AMD_GPU_COUNT=0
+    LOCAL_HAS_AMD=false
+
+    if ! command -v rocm-smi &>/dev/null; then
+        return 1
+    fi
+
+    # rocm-smi lists GPUs with "GPU[N]" prefix; count unique GPU entries
+    local count
+    count=$(rocm-smi --showid 2>/dev/null | grep -cE '^GPU\[' || echo 0)
+
+    if [[ -n "$count" && "$count" =~ ^[0-9]+$ && "$count" -gt 0 ]]; then
+        LOCAL_AMD_GPU_COUNT="$count"
+        LOCAL_HAS_AMD=true
         return 0
     fi
     return 1
@@ -438,8 +465,8 @@ format_nodename_line() {
 
     local line="NodeName=${LOCAL_HOSTNAME} CPUs=${LOCAL_CPUS} RealMemory=${LOCAL_MEMORY_MB} Sockets=${LOCAL_SOCKETS:-1} CoresPerSocket=${LOCAL_CORES_PER_SOCKET:-${LOCAL_CPUS}} ThreadsPerCore=${LOCAL_THREADS_PER_CORE:-1}"
 
-    # Add GRES for NVIDIA GPUs if detected
-    if [[ "${LOCAL_HAS_NVIDIA:-false}" == "true" && "${LOCAL_GPU_COUNT:-0}" -gt 0 ]]; then
+    # Add GRES for GPUs if any detected (NVIDIA or AMD)
+    if [[ "${LOCAL_GPU_COUNT:-0}" -gt 0 ]]; then
         line="${line} Gres=gpu:${LOCAL_GPU_COUNT}"
     fi
 
@@ -465,7 +492,10 @@ show_detected_hardware() {
     lines+=("${BOLD}CoresPerSocket:${RESET}    ${LOCAL_CORES_PER_SOCKET:-${LOCAL_CPUS}}")
     lines+=("${BOLD}ThreadsPerCore:${RESET}    ${LOCAL_THREADS_PER_CORE:-1}")
     if [[ "${LOCAL_HAS_NVIDIA:-false}" == "true" ]]; then
-        lines+=("${BOLD}NVIDIA GPUs:${RESET}       ${LOCAL_GPU_COUNT}")
+        lines+=("${BOLD}NVIDIA GPUs:${RESET}       ${LOCAL_NVIDIA_GPU_COUNT}")
+    fi
+    if [[ "${LOCAL_HAS_AMD:-false}" == "true" ]]; then
+        lines+=("${BOLD}AMD GPUs:${RESET}          ${LOCAL_AMD_GPU_COUNT}")
     fi
     lines+=("")
     lines+=("${BOLD}NodeName line:${RESET}")
