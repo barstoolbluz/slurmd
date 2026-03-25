@@ -49,7 +49,23 @@ Tracks packages installed by the installer (vs. pre-existing) for clean uninstal
 - State file: `/etc/slurm/.installer-state`
 - `record_installed_package "pkg"` — records that we installed a package
 - `was_installed_by_us "pkg"` — returns 0 if we installed it, 1 otherwise
-- Used for chrony and mariadb-server; uninstall only offers to remove what we installed
+- Tracked packages: `chrony`, `mariadb-server`, `mariadb-container`
+- Uninstall only offers to remove what we installed
+
+### Container Runtime
+Support for Docker and Podman (prefers Podman if both available):
+- `detect_container_runtime()` — sets `CONTAINER_RUNTIME` global to "podman" or "docker"
+- `has_container_runtime()` — returns 0 if a runtime is available
+- `container_exists "name"` — checks if container exists
+- `container_is_running "name"` — checks if container is running
+
+### MariaDB Container Option
+Database roles offer native or containerized MariaDB:
+- `USE_MARIADB_CONTAINER` global in database.sh controls the path
+- `choose_mariadb_method()` — prompts user, sets the global
+- Container uses systemd service `slurm-mariadb` (template: `mariadb-container.service.tmpl`)
+- Data persisted in `/var/lib/slurm-mariadb`
+- slurmdbd.service gets a drop-in dependency on slurm-mariadb.service when using container
 
 ### SSH Modes for --setup-nodes
 Three modes supported via `SSH_MODE` global:

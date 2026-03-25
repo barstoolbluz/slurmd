@@ -22,11 +22,13 @@ The installer walks you through selecting a node role and configuring the cluste
 
 | Role | What it installs | Daemons |
 |------|-----------------|---------|
-| **Controller + Database** | slurmctld, slurmdbd, MariaDB, MUNGE, client tools | slurmctld, slurmdbd, mariadbd, munged |
+| **Controller + Database** | slurmctld, slurmdbd, MariaDB*, MUNGE, client tools | slurmctld, slurmdbd, mariadbd/container, munged |
 | **Controller only** | slurmctld, MUNGE, client tools | slurmctld, munged |
-| **Database only** | slurmdbd, MariaDB, MUNGE | slurmdbd, mariadbd, munged |
+| **Database only** | slurmdbd, MariaDB*, MUNGE | slurmdbd, mariadbd/container, munged |
 | **Compute node** | slurmd, MUNGE, client tools | slurmd, munged |
 | **Login node** | MUNGE, client tools | munged |
+
+*MariaDB can be installed natively (Debian package) or run in a Docker/Podman container.
 
 ## Cluster setup order
 
@@ -95,6 +97,42 @@ config/
     slurmdbd.conf.tmpl  slurmdbd.conf template
     cgroup.conf.tmpl    cgroup.conf template
     gres.conf.tmpl      gres.conf template (GPU support)
+    mariadb-container.service.tmpl  systemd unit for containerized MariaDB
+```
+
+## MariaDB: Native vs Container
+
+When installing database roles (Controller + Database or Database only), the installer offers two options for running MariaDB:
+
+### Native (Debian package)
+
+- Uses Debian's `mariadb-server` package
+- Integrated with system package management
+- Familiar to sysadmins, easy to manage with standard tools
+- Automatic security updates via apt
+
+### Container (Docker/Podman)
+
+- Runs MariaDB in an isolated container
+- Data persisted in `/var/lib/slurm-mariadb`
+- Easy version upgrades (just pull new image)
+- Consistent MariaDB version across different Debian releases
+- Managed via systemd service `slurm-mariadb`
+
+**Container requirements:**
+- Docker (`docker.io` package) or Podman (`podman` package)
+- If neither is installed, the installer offers to install one
+
+**Container management:**
+```bash
+# Check container status
+systemctl status slurm-mariadb
+
+# View container logs
+docker logs slurm-mariadb   # or: podman logs slurm-mariadb
+
+# Restart the container
+systemctl restart slurm-mariadb
 ```
 
 ## What the installer does

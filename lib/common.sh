@@ -516,6 +516,14 @@ backup_file() {
     fi
 }
 
+# Generate a random password.
+# Usage: generate_password [length]
+# Default length is 16 characters.
+generate_password() {
+    local length="${1:-16}"
+    openssl rand -base64 "$length" 2>/dev/null | tr -d '\n' | head -c "$length"
+}
+
 # Render a template file by replacing %%VAR%% placeholders with values
 # from an associative array.
 # Usage:
@@ -540,6 +548,43 @@ render_template() {
     printf '%s\n' "$content" > "$output"
 }
 
+# ── Container Runtime ─────────────────────────────────────────────────────────
+
+# Global: detected container runtime (podman or docker)
+CONTAINER_RUNTIME=""
+
+# Detect available container runtime (prefer podman over docker).
+# Sets CONTAINER_RUNTIME global variable.
+# Returns 0 if a runtime is found, 1 otherwise.
+detect_container_runtime() {
+    if command -v podman &>/dev/null; then
+        CONTAINER_RUNTIME="podman"
+        return 0
+    elif command -v docker &>/dev/null; then
+        CONTAINER_RUNTIME="docker"
+        return 0
+    fi
+    CONTAINER_RUNTIME=""
+    return 1
+}
+
+# Check if a container runtime is available.
+has_container_runtime() {
+    [[ -n "$CONTAINER_RUNTIME" ]] || detect_container_runtime
+}
+
+# Check if a container exists (running or stopped).
+container_exists() {
+    local name="$1"
+    $CONTAINER_RUNTIME container exists "$name" 2>/dev/null
+}
+
+# Check if a container is running.
+container_is_running() {
+    local name="$1"
+    [[ "$($CONTAINER_RUNTIME inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" == "true" ]]
+}
+
 # ── Uninstall ────────────────────────────────────────────────────────────────
 
 # Completely remove Slurm and MUNGE from this node.
@@ -550,9 +595,11 @@ uninstall_slurm() {
     # Read installer state BEFORE we might delete /etc/slurm
     local we_installed_chrony=false
     local we_installed_mariadb=false
+    local we_installed_mariadb_container=false
     if [[ -f "$INSTALLER_STATE_FILE" ]]; then
         was_installed_by_us "chrony" && we_installed_chrony=true
         was_installed_by_us "mariadb-server" && we_installed_mariadb=true
+        was_installed_by_us "mariadb-container" && we_installed_mariadb_container=true
     fi
 
     echo -e "${YELLOW}This will:${RESET}"
@@ -561,6 +608,7 @@ uninstall_slurm() {
     echo "  - Optionally remove configuration files"
     echo "  - Optionally remove state/log directories"
     $we_installed_mariadb && echo "  - Optionally remove MariaDB (installed by this installer)"
+    $we_installed_mariadb_container && echo "  - Optionally remove MariaDB container (installed by this installer)"
     $we_installed_chrony && echo "  - Optionally remove chrony (installed by this installer)"
     echo
 
@@ -603,14 +651,19 @@ uninstall_slurm() {
     # MariaDB/slurm database
     if confirm "Drop Slurm database from MariaDB (if exists)?" "default_no"; then
         if systemctl is-active --quiet mariadb 2>/dev/null; then
+            # Native MariaDB
             mysql -e "DROP DATABASE IF EXISTS slurm_acct_db; DROP USER IF EXISTS 'slurm'@'localhost';" 2>/dev/null || true
+            log_success "Database dropped."
+        elif systemctl is-active --quiet slurm-mariadb 2>/dev/null; then
+            # Containerized MariaDB - connect via TCP
+            mysql -h 127.0.0.1 -e "DROP DATABASE IF EXISTS slurm_acct_db; DROP USER IF EXISTS 'slurm'@'localhost';" 2>/dev/null || true
             log_success "Database dropped."
         else
             log_info "MariaDB not running, skipping database cleanup."
         fi
     fi
 
-    # MariaDB (only if we installed it)
+    # MariaDB native (only if we installed it)
     if $we_installed_mariadb; then
         if confirm "Remove MariaDB server (installed by this installer)?" "default_no"; then
             log_info "Removing MariaDB..."
@@ -619,6 +672,34 @@ uninstall_slurm() {
             DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || true
             rm -rf /var/lib/mysql /etc/mysql
             log_success "MariaDB removed."
+        fi
+    fi
+
+    # MariaDB container (only if we installed it)
+    if $we_installed_mariadb_container; then
+        if confirm "Remove MariaDB container (installed by this installer)?" "default_no"; then
+            log_info "Removing MariaDB container..."
+            # Stop and disable systemd service
+            systemctl stop slurm-mariadb 2>/dev/null || true
+            systemctl disable slurm-mariadb 2>/dev/null || true
+            rm -f /etc/systemd/system/slurm-mariadb.service
+            # Remove slurmdbd dependency drop-in
+            rm -f /etc/systemd/system/slurmdbd.service.d/container-dependency.conf
+            rmdir /etc/systemd/system/slurmdbd.service.d 2>/dev/null || true
+            systemctl daemon-reload 2>/dev/null || true
+            # Remove container
+            detect_container_runtime || true
+            if [[ -n "$CONTAINER_RUNTIME" ]]; then
+                $CONTAINER_RUNTIME rm -f slurm-mariadb 2>/dev/null || true
+            fi
+            log_success "MariaDB container removed."
+            # Offer to remove data volume
+            if [[ -d /var/lib/slurm-mariadb ]]; then
+                if confirm "Remove MariaDB container data (/var/lib/slurm-mariadb)?" "default_no"; then
+                    rm -rf /var/lib/slurm-mariadb
+                    log_success "Container data removed."
+                fi
+            fi
         fi
     fi
 
