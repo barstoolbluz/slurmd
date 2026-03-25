@@ -1137,7 +1137,12 @@ verify_install() {
     # Check role-specific services
     case "$NODE_ROLE" in
         controller_db)
-            for svc in mariadb slurmdbd slurmctld; do
+            # Check MariaDB service (native or container)
+            local mariadb_svc="mariadb"
+            if $USE_MARIADB_CONTAINER; then
+                mariadb_svc="slurm-mariadb"
+            fi
+            for svc in "$mariadb_svc" slurmdbd slurmctld; do
                 if is_service_active "$svc"; then
                     log_success "${svc}.service is running."
                 else
@@ -1171,7 +1176,12 @@ verify_install() {
             fi
             ;;
         database)
-            for svc in mariadb slurmdbd; do
+            # Check MariaDB service (native or container)
+            local mariadb_svc="mariadb"
+            if $USE_MARIADB_CONTAINER; then
+                mariadb_svc="slurm-mariadb"
+            fi
+            for svc in "$mariadb_svc" slurmdbd; do
                 if is_service_active "$svc"; then
                     log_success "${svc}.service is running."
                 else
