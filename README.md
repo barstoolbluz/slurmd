@@ -72,6 +72,10 @@ You'll be prompted to optionally remove:
 - Configuration files (`/etc/slurm`, `/etc/munge`)
 - State and log directories (`/var/lib/slurm`, `/var/log/slurm`, `/var/spool/slurm`)
 - Slurm database from MariaDB (if applicable)
+- MariaDB server (if installed by this installer)
+- chrony (if installed by this installer)
+
+The installer tracks which packages it installed (vs. pre-existing) in `/etc/slurm/.installer-state`. Only packages the installer actually installed will be offered for removal, ensuring pre-existing services aren't accidentally deleted.
 
 ## Repository layout
 
