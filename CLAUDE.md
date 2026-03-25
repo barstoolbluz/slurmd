@@ -87,6 +87,16 @@ If compute nodes are skipped during initial setup, `--setup-nodes` can add them 
 - When `--setup-nodes` finds no nodes, it offers to add them via `gather_compute_nodes()`
 - Automatically updates partition definitions and enables GresTypes if GPUs detected
 
+### Updating Existing Node Configurations
+`--setup-nodes` offers to review/update existing node configs before distributing:
+- `show_existing_nodes()` — displays current NodeName lines from slurm.conf
+- `review_node_configs()` — interactive per-node review with three options:
+  - Keep current configuration
+  - Update via SSH (runs `slurmd -C` on remote node)
+  - Enter new configuration manually
+- `fetch_node_hardware()` — SSHs to node and retrieves `slurmd -C` output
+- `update_node_config()` — replaces a node's line in slurm.conf
+
 ### GPU Detection
 NVIDIA and AMD GPUs are auto-detected:
 - `detect_nvidia_gpus()` in common.sh sets `LOCAL_NVIDIA_GPU_COUNT` and `LOCAL_HAS_NVIDIA` via `nvidia-smi`

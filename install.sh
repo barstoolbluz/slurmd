@@ -224,6 +224,149 @@ get_remote_nodes() {
     done
 }
 
+# Display current node configurations from slurm.conf.
+show_existing_nodes() {
+    local conf_content
+    conf_content=$(local_read_file /etc/slurm/slurm.conf) || return 1
+
+    echo
+    log_info "Current compute nodes in slurm.conf:"
+    echo
+
+    while IFS= read -r line; do
+        local nodename
+        nodename=$(echo "$line" | grep -oP 'NodeName=\K[^\s]+')
+        echo -e "  ${CYAN}${nodename}${RESET}"
+        echo -e "    ${line}"
+    done < <(echo "$conf_content" | grep -E '^NodeName=')
+    echo
+}
+
+# Fetch hardware config from remote node via SSH.
+# Usage: fetch_node_hardware "hostname"
+# Returns: NodeName line from slurmd -C, or empty on failure.
+# Requires: SSH_MODE and SSH_USER globals to be set.
+fetch_node_hardware() {
+    local node="$1"
+    local ssh_target="${SSH_USER}@${node}"
+    local hw_line=""
+    local slurmd_cmd="/usr/sbin/slurmd -C 2>/dev/null | head -1"
+
+    case "$SSH_MODE" in
+        root)
+            hw_line=$(ssh -q -o BatchMode=yes -o ConnectTimeout=10 \
+                "root@${node}" "$slurmd_cmd" 2>/dev/null) || return 1
+            ;;
+        sudo_passwordless)
+            hw_line=$(ssh -q -o BatchMode=yes -o ConnectTimeout=10 \
+                "$ssh_target" "sudo $slurmd_cmd" 2>/dev/null) || return 1
+            ;;
+        sudo_password)
+            hw_line=$(ssh -o ConnectTimeout=10 \
+                "$ssh_target" "sudo $slurmd_cmd" 2>/dev/null) || return 1
+            ;;
+    esac
+
+    # Validate output
+    if [[ -z "$hw_line" || ! "$hw_line" =~ ^NodeName= ]]; then
+        return 1
+    fi
+
+    echo "$hw_line"
+}
+
+# Update a node's configuration in slurm.conf.
+# Usage: update_node_config "nodename" "new NodeName=... line"
+update_node_config() {
+    local nodename="$1"
+    local new_line="$2"
+    local conf_file="/etc/slurm/slurm.conf"
+
+    # Backup first
+    backup_file "$conf_file"
+
+    # Use awk for replacement - safer than sed with special characters
+    # Exact match on first field avoids regex issues with dots in FQDNs
+    local_sudo awk -v target="NodeName=${nodename}" -v newline="$new_line" '
+        $1 == target { print newline; next }
+        { print }
+    ' "$conf_file" > "${conf_file}.tmp" && local_sudo mv "${conf_file}.tmp" "$conf_file"
+
+    log_success "Updated ${nodename} in slurm.conf"
+}
+
+# Interactive review and update of existing node configurations.
+# Usage: review_node_configs "node1\nnode2\n..."
+# Requires: SSH_MODE and SSH_USER globals to be set.
+review_node_configs() {
+    local nodes="$1"
+    local changes_made=false
+
+    while IFS= read -r node; do
+        [[ -z "$node" ]] && continue
+
+        # Get current config (escape dots in node name for regex - FQDNs contain dots)
+        local node_escaped="${node//./\\.}"
+        local current_line
+        current_line=$(local_read_file /etc/slurm/slurm.conf | grep -E "^NodeName=${node_escaped}[[:space:]]")
+
+        echo
+        echo -e "${BOLD}Node: ${node}${RESET}"
+        echo -e "  Current config:"
+        echo -e "    ${current_line}"
+        echo
+
+        menu_select "Action for ${node}:" \
+            "Keep current configuration" \
+            "Update via SSH (run slurmd -C on ${node})" \
+            "Enter new configuration manually"
+
+        case "$REPLY" in
+            1)
+                log_info "Keeping current config for ${node}"
+                ;;
+            2)
+                log_info "Fetching hardware info from ${node}..."
+                local new_line
+                if new_line=$(fetch_node_hardware "$node"); then
+                    echo -e "  Detected:"
+                    echo -e "    ${CYAN}${new_line}${RESET}"
+                    echo
+                    if confirm "Apply this configuration?" "default_yes"; then
+                        update_node_config "$node" "$new_line"
+                        changes_made=true
+                    fi
+                else
+                    log_error "Could not fetch hardware from ${node}"
+                    log_info "Ensure slurmd is installed and SSH access works."
+                fi
+                ;;
+            3)
+                echo
+                echo -e "Enter new NodeName line for ${node}:"
+                echo -e "  (Paste output from 'slurmd -C' on the node)"
+                read -rp "Config> " new_line
+                if [[ "$new_line" =~ ^NodeName= ]]; then
+                    update_node_config "$node" "$new_line"
+                    changes_made=true
+                else
+                    log_warn "Invalid format — must start with NodeName="
+                fi
+                ;;
+        esac
+    done <<< "$nodes"
+
+    if $changes_made; then
+        echo
+        log_info "Reconfiguring slurmctld to apply changes..."
+        if local_sudo scontrol reconfigure 2>/dev/null; then
+            log_success "Controller reconfigured."
+        else
+            log_warn "Could not reconfigure controller. Run 'scontrol reconfigure' manually."
+        fi
+    fi
+}
+
 # Test SSH connectivity to a node and report issues.
 # Usage: test_ssh_connectivity "hostname"
 # Returns 0 if OK, 1 if failed (with helpful error message).
@@ -811,6 +954,15 @@ setup_remote_nodes() {
         log_info "No distributable nodes (simple hostnames) found."
         log_info "Node ranges (e.g., node[01-10]) must be distributed manually."
         exit 0
+    fi
+
+    # Offer to review/update existing node configurations
+    show_existing_nodes
+
+    if confirm "Review or update node configurations before distributing?" "default_no"; then
+        review_node_configs "$nodes"
+        # Re-fetch in case node names changed (unlikely but possible)
+        nodes=$(get_remote_nodes)
     fi
 
     echo
