@@ -452,7 +452,7 @@ sudo chmod 0644 /etc/slurm/slurm.conf
 
 ## Known limitations
 
-This installer provides a straightforward single-cluster setup. It does not support:
+This installer provides a straightforward single-cluster setup. Feature support:
 
 | Feature | Status | Notes |
 |---------|--------|-------|
