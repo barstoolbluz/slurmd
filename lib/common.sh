@@ -675,8 +675,11 @@ uninstall_slurm() {
         if confirm "Remove MariaDB server (installed by this installer)?" "default_no"; then
             log_info "Removing MariaDB..."
             systemctl stop mariadb 2>/dev/null || true
-            DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y mariadb-server mariadb-client 2>/dev/null || true
-            DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || true
+            # Purge all MariaDB/MySQL packages to avoid broken alternatives on reinstall
+            DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y \
+                mariadb-server mariadb-server-core mariadb-client mariadb-client-core \
+                mariadb-common mysql-common 2>/dev/null || true
+            DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y 2>/dev/null || true
             rm -rf /var/lib/mysql /etc/mysql
             log_success "MariaDB removed."
         fi
