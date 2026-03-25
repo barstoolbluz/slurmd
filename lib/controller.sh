@@ -104,17 +104,12 @@ generate_cgroup_conf() {
     log_info "cgroup.conf written to ${conf_file}."
 }
 
-# Generate gres.conf for GPU support (controller-as-compute case).
-# Only creates gres.conf if GPUs (NVIDIA or AMD) are detected.
+# Generate gres.conf for GPU support.
+# Always creates gres.conf with AutoDetect=any so it can be distributed to compute nodes
+# via --setup-nodes, regardless of whether the controller itself has GPUs.
 generate_gres_conf() {
     local conf_file="/etc/slurm/gres.conf"
     local template="${SCRIPT_DIR}/config/templates/gres.conf.tmpl"
-
-    # Only needed if this node has GPUs
-    if [[ "${LOCAL_GPU_COUNT:-0}" -eq 0 ]]; then
-        log_info "No GPUs detected — skipping gres.conf."
-        return 0
-    fi
 
     if [[ -f "$conf_file" ]]; then
         log_info "gres.conf already exists, keeping it."
@@ -220,6 +215,7 @@ setup_controller() {
     install_controller_packages
     generate_slurm_conf
     generate_cgroup_conf
+    generate_gres_conf
     start_slurmctld
     register_cluster
     setup_default_account
