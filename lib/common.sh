@@ -436,6 +436,70 @@ render_template() {
     printf '%s\n' "$content" > "$output"
 }
 
+# ── Uninstall ────────────────────────────────────────────────────────────────
+
+# Completely remove Slurm and MUNGE from this node.
+# Prompts user for confirmation and options.
+uninstall_slurm() {
+    log_step "Uninstalling Slurm"
+
+    echo -e "${YELLOW}This will:${RESET}"
+    echo "  - Stop all Slurm services (slurmctld, slurmdbd, slurmd, munge)"
+    echo "  - Remove Slurm and MUNGE packages"
+    echo "  - Optionally remove configuration files"
+    echo "  - Optionally remove state/log directories"
+    echo
+
+    if ! confirm "Proceed with uninstall?" "default_no"; then
+        log_info "Uninstall cancelled."
+        exit 0
+    fi
+
+    # Stop services (ignore errors if not installed)
+    log_info "Stopping services..."
+    for svc in slurmctld slurmdbd slurmd munge; do
+        systemctl stop "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+    done
+    log_success "Services stopped."
+
+    # Remove packages
+    log_info "Removing packages..."
+    DEBIAN_FRONTEND=noninteractive apt-get remove -y slurmd slurmctld slurmdbd slurm-client slurm-wlm-basic-plugins munge libmunge2 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || true
+    log_success "Packages removed."
+
+    # Config files
+    if confirm "Remove configuration files (/etc/slurm, /etc/munge)?" "default_no"; then
+        rm -rf /etc/slurm /etc/munge
+        log_success "Configuration files removed."
+    else
+        log_info "Keeping configuration files."
+    fi
+
+    # State directories
+    if confirm "Remove state and log directories (/var/lib/slurm, /var/log/slurm, /var/spool/slurm)?" "default_no"; then
+        rm -rf /var/lib/slurm /var/log/slurm /var/spool/slurm /var/spool/slurmctld /var/spool/slurmd
+        rm -rf /var/lib/munge /var/log/munge /run/munge
+        log_success "State directories removed."
+    else
+        log_info "Keeping state directories."
+    fi
+
+    # MariaDB/slurm database
+    if confirm "Drop Slurm database from MariaDB (if exists)?" "default_no"; then
+        if systemctl is-active --quiet mariadb 2>/dev/null; then
+            mysql -e "DROP DATABASE IF EXISTS slurm_acct_db; DROP USER IF EXISTS 'slurm'@'localhost';" 2>/dev/null || true
+            log_success "Database dropped."
+        else
+            log_info "MariaDB not running, skipping database cleanup."
+        fi
+    fi
+
+    log_success "Slurm uninstall complete."
+    log_info "You may now re-run the installer for a fresh setup."
+}
+
 # Check if a systemd service is active.
 is_service_active() {
     systemctl is-active --quiet "$1" 2>/dev/null

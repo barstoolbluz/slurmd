@@ -67,8 +67,8 @@ generate_slurm_conf() {
 
     render_template "$template" "$conf_file" vars
 
-    chown root:slurm "$conf_file"
-    chmod 0640 "$conf_file"
+    chown root:root "$conf_file"
+    chmod 0644 "$conf_file"
 
     log_success "slurm.conf written to ${conf_file}."
     log_info "This file must be copied identically to all other cluster nodes."
@@ -89,8 +89,8 @@ generate_cgroup_conf() {
 
     render_template "$template" "$conf_file" vars
 
-    chown root:slurm "$conf_file"
-    chmod 0640 "$conf_file"
+    chown root:root "$conf_file"
+    chmod 0644 "$conf_file"
 
     log_info "cgroup.conf written to ${conf_file}."
 }
@@ -120,6 +120,62 @@ register_cluster() {
     fi
 }
 
+# Set up default Slurm account and optionally add system users.
+# This enables job submission without manual sacctmgr commands.
+setup_default_account() {
+    log_step "Setting up default Slurm account"
+
+    # Only for roles with accounting database
+    if [[ "${NODE_ROLE}" != "controller_db" && -z "${DBD_HOSTNAME:-}" ]]; then
+        log_info "No accounting database — skipping account setup."
+        return 0
+    fi
+
+    # Wait for slurmdbd to be ready
+    sleep 2
+
+    local default_account="compute"
+
+    # Create default account if not exists
+    if ! sacctmgr -n show account "$default_account" 2>/dev/null | grep -qw "$default_account"; then
+        sacctmgr -i add account "$default_account" Description="Default compute account"
+        log_success "Created account: ${default_account}"
+    else
+        log_info "Account '${default_account}' already exists."
+    fi
+
+    # Prompt to add current system users
+    echo
+    if confirm "Add current system users to Slurm accounting?" "default_yes"; then
+        setup_slurm_users "$default_account"
+    fi
+}
+
+# Add system users to Slurm accounting.
+# Usage: setup_slurm_users "account_name"
+setup_slurm_users() {
+    local account="$1"
+
+    # Get list of normal users (UID >= 1000, has login shell)
+    local users
+    users=$(awk -F: '$3 >= 1000 && $7 !~ /nologin|false/ {print $1}' /etc/passwd)
+
+    if [[ -z "$users" ]]; then
+        log_info "No regular users found to add."
+        return 0
+    fi
+
+    log_info "Found users: $users"
+    for user in $users; do
+        if ! sacctmgr -n show user "$user" 2>/dev/null | grep -qw "$user"; then
+            sacctmgr -i add user "$user" account="$account"
+            log_success "Added user: ${user} -> account=${account}"
+        else
+            log_info "User '${user}' already exists in accounting."
+        fi
+    done
+}
+
 # ── Main entry point ───────────────────────────────────────────────────────
 
 setup_controller() {
@@ -128,4 +184,5 @@ setup_controller() {
     generate_cgroup_conf
     start_slurmctld
     register_cluster
+    setup_default_account
 }

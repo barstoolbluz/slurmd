@@ -75,8 +75,8 @@ setup_slurm_conf_compute() {
             ;;
     esac
 
-    chown root:slurm "$conf_file"
-    chmod 0640 "$conf_file"
+    chown root:root "$conf_file"
+    chmod 0644 "$conf_file"
 }
 
 generate_slurm_conf_interactive() {
@@ -135,8 +135,8 @@ setup_cgroup_conf_compute() {
 
     render_template "$template" "$conf_file" vars
 
-    chown root:slurm "$conf_file"
-    chmod 0640 "$conf_file"
+    chown root:root "$conf_file"
+    chmod 0644 "$conf_file"
 
     log_info "cgroup.conf written to ${conf_file}."
 }

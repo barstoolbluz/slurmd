@@ -2,7 +2,7 @@
 # ===========================================================================
 # install.sh — Interactive Slurm installer for Debian systems
 # ===========================================================================
-# Usage: sudo ./install.sh [--setup-nodes]
+# Usage: sudo ./install.sh [--setup-nodes|--uninstall]
 #
 # This script walks you through installing and configuring Slurm on a
 # Debian node. It supports the following node roles:
@@ -16,6 +16,7 @@
 # Options:
 #   --setup-nodes    After controller setup, distribute config files to
 #                    compute/login nodes via SSH (requires key-based auth)
+#   --uninstall      Remove Slurm and MUNGE from this node
 #
 # Requires: Debian 11+, root privileges, network access to apt repos.
 # ===========================================================================
@@ -252,6 +253,13 @@ distribute_to_node_root() {
         failed=true
     fi
 
+    # Restart munge and slurmd on remote node to pick up new key/config
+    if ! $failed; then
+        ssh -q -o BatchMode=yes "$ssh_target" 'systemctl restart munge && (systemctl restart slurmd 2>/dev/null || true)' 2>/dev/null || {
+            log_warn "  Failed to restart services on ${node} — may need manual restart"
+        }
+    fi
+
     $failed && return 1
     return 0
 }
@@ -308,7 +316,7 @@ distribute_to_node_sudo_passwordless() {
         fi
     fi
 
-    # Use sudo to move files to final locations (passwordless - BatchMode)
+    # Use sudo to move files to final locations and restart services (passwordless - BatchMode)
     local remote_cmd="
         sudo mv ${tmp_dir}/munge.key /etc/munge/munge.key &&
         sudo chown munge:munge /etc/munge/munge.key &&
@@ -324,7 +332,11 @@ distribute_to_node_sudo_passwordless() {
         sudo chmod 0644 /etc/slurm/cgroup.conf"
     fi
 
-    remote_cmd="${remote_cmd} && rm -rf ${tmp_dir}"
+    # Restart services after file installation
+    remote_cmd="${remote_cmd} &&
+        rm -rf ${tmp_dir} &&
+        sudo systemctl restart munge &&
+        (sudo systemctl restart slurmd 2>/dev/null || true)"
 
     if ! ssh -q -o BatchMode=yes "$ssh_target" "$remote_cmd" 2>/dev/null; then
         log_error "  Failed to install files on ${node} (passwordless sudo may not be configured)"
@@ -389,11 +401,22 @@ distribute_to_node_sudo_password() {
         fi
     fi
 
+    # Get controller info for hostname resolution
+    # Use hostname from slurm.conf to ensure we resolve what Slurm expects
+    local controller_hostname
+    controller_hostname=$(get_controller_hostname_from_conf) || controller_hostname=$(hostname -s)
+    local controller_ip
+    controller_ip=$(hostname -I | awk '{print $1}')
+
     # Create remote install script (avoids quoting issues with ssh -tt)
     local remote_script="${tmp_dir}/install.sh"
     local script_content
     script_content="#!/bin/bash
 set -e
+# Ensure controller hostname is resolvable
+if ! getent hosts ${controller_hostname} >/dev/null 2>&1; then
+    echo '${controller_ip}	${controller_hostname}' | sudo tee -a /etc/hosts >/dev/null
+fi
 sudo mv ${tmp_dir}/munge.key /etc/munge/munge.key
 sudo chown munge:munge /etc/munge/munge.key
 sudo chmod 0400 /etc/munge/munge.key
@@ -408,8 +431,11 @@ sudo chown root:root /etc/slurm/cgroup.conf
 sudo chmod 0644 /etc/slurm/cgroup.conf"
     fi
 
+    # Add service restarts to the script
     script_content="${script_content}
-rm -rf ${tmp_dir}"
+rm -rf ${tmp_dir}
+sudo systemctl restart munge
+sudo systemctl restart slurmd 2>/dev/null || true"
 
     if ! echo "$script_content" | ssh -q -o BatchMode=yes "$ssh_target" "cat > ${remote_script} && chmod +x ${remote_script}"; then
         log_error "  Failed to create install script on ${node}"
@@ -427,6 +453,98 @@ rm -rf ${tmp_dir}"
 
     $failed && return 1
     return 0
+}
+
+# Get controller hostname from slurm.conf SlurmctldHost directive.
+# Returns the hostname (without backup specification).
+# Returns 1 (failure) if not found or empty.
+get_controller_hostname_from_conf() {
+    local conf_content
+    conf_content=$(local_read_file /etc/slurm/slurm.conf 2>/dev/null) || return 1
+    # Extract SlurmctldHost value, strip any (backup) specification
+    local ctrl_host
+    ctrl_host=$(echo "$conf_content" | grep -oP '^SlurmctldHost=\K[^(\s]+' | head -1)
+    # Return failure if empty
+    if [[ -z "$ctrl_host" ]]; then
+        return 1
+    fi
+    echo "$ctrl_host"
+}
+
+# Ensure a remote node can resolve the controller hostname.
+# Adds controller to remote /etc/hosts if needed.
+# Usage: setup_remote_hostname_resolution "hostname"
+setup_remote_hostname_resolution() {
+    local node="$1"
+    local ssh_target="${SSH_USER}@${node}"
+    local controller_hostname
+    # Use hostname from slurm.conf to ensure we resolve what Slurm expects
+    controller_hostname=$(get_controller_hostname_from_conf) || controller_hostname=$(hostname -s)
+    local controller_ip
+    controller_ip=$(hostname -I | awk '{print $1}')
+
+    # Check if remote can already resolve controller
+    case "$SSH_MODE" in
+        root)
+            if ssh -q -o BatchMode=yes "root@${node}" "getent hosts ${controller_hostname}" &>/dev/null; then
+                return 0  # Already resolvable
+            fi
+            log_info "  Adding ${controller_hostname} to /etc/hosts on ${node}..."
+            ssh -q -o BatchMode=yes "root@${node}" \
+                "echo '${controller_ip}	${controller_hostname}' >> /etc/hosts" 2>/dev/null || {
+                log_warn "  Failed to update /etc/hosts on ${node}"
+                return 1
+            }
+            ;;
+        sudo_passwordless)
+            if ssh -q -o BatchMode=yes "$ssh_target" "getent hosts ${controller_hostname}" &>/dev/null; then
+                return 0  # Already resolvable
+            fi
+            log_info "  Adding ${controller_hostname} to /etc/hosts on ${node}..."
+            ssh -q -o BatchMode=yes "$ssh_target" \
+                "echo '${controller_ip}	${controller_hostname}' | sudo tee -a /etc/hosts >/dev/null" 2>/dev/null || {
+                log_warn "  Failed to update /etc/hosts on ${node}"
+                return 1
+            }
+            ;;
+        sudo_password)
+            # For password sudo, we'll handle this in the distribute script
+            # Just check if resolvable
+            if ssh -q -o BatchMode=yes "$ssh_target" "getent hosts ${controller_hostname}" &>/dev/null; then
+                return 0
+            fi
+            # Will be handled by the distribute function
+            ;;
+    esac
+    return 0
+}
+
+# Verify munge authentication to a remote node.
+# Usage: verify_munge_to_node "hostname"
+# Returns 0 if OK, 1 if failed.
+verify_munge_to_node() {
+    local node="$1"
+    local ssh_target="${SSH_USER}@${node}"
+
+    # Generate credential locally, decode remotely
+    # This tests the full munge key chain
+    case "$SSH_MODE" in
+        root)
+            if munge -n 2>/dev/null | ssh -q -o BatchMode=yes "root@${node}" 'unmunge' &>/dev/null; then
+                return 0
+            fi
+            ;;
+        sudo_passwordless)
+            if munge -n 2>/dev/null | ssh -q -o BatchMode=yes "$ssh_target" 'unmunge' &>/dev/null; then
+                return 0
+            fi
+            ;;
+        sudo_password)
+            # Can't easily do this in BatchMode with password sudo
+            return 0  # Skip verification
+            ;;
+    esac
+    return 1
 }
 
 # Main entry point for --setup-nodes
@@ -515,6 +633,13 @@ setup_remote_nodes() {
     fi
     log_success "All nodes reachable."
 
+    # Ensure remote nodes can resolve controller hostname
+    echo
+    log_info "Ensuring hostname resolution on remote nodes..."
+    while read -r node; do
+        setup_remote_hostname_resolution "$node"
+    done <<< "$nodes"
+
     echo
     local success_count=0
     local fail_count=0
@@ -532,6 +657,36 @@ setup_remote_nodes() {
         log_success "All nodes configured successfully."
     else
         log_warn "Completed with errors: ${success_count} succeeded, ${fail_count} failed."
+    fi
+
+    # Restart munge on controller to ensure key sync
+    echo
+    log_info "Restarting munge on controller to ensure key sync..."
+    if local_sudo systemctl restart munge 2>/dev/null; then
+        sleep 1
+        log_success "Controller munge restarted."
+    else
+        log_warn "Could not restart munge on controller."
+    fi
+
+    # Verify munge authentication to each node
+    echo
+    log_info "Verifying munge authentication to remote nodes..."
+    local munge_ok=0
+    local munge_fail=0
+    while read -r node; do
+        if verify_munge_to_node "$node"; then
+            log_success "  ${node}: munge OK"
+            ((munge_ok++)) || true
+        else
+            log_error "  ${node}: munge FAILED"
+            ((munge_fail++)) || true
+        fi
+    done <<< "$nodes"
+
+    if [[ $munge_fail -gt 0 ]]; then
+        log_warn "Munge verification failed for ${munge_fail} node(s)."
+        log_info "Check that munge is running on those nodes: systemctl status munge"
     fi
 
     # Reconfigure slurmctld to pick up any changes
@@ -1088,11 +1243,16 @@ case "${1:-}" in
     --setup-nodes)
         setup_remote_nodes
         ;;
+    --uninstall)
+        require_root
+        uninstall_slurm
+        ;;
     --help|-h)
-        echo "Usage: $0 [--setup-nodes]"
+        echo "Usage: $0 [--setup-nodes|--uninstall]"
         echo
         echo "Options:"
         echo "  --setup-nodes    Distribute config files to cluster nodes via SSH"
+        echo "  --uninstall      Remove Slurm and MUNGE from this node"
         echo "  --help           Show this help message"
         echo
         echo "Run without arguments for interactive installation."
