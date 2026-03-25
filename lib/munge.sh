@@ -64,6 +64,60 @@ generate_munge_key() {
     echo
 }
 
+fetch_munge_key_from_controller() {
+    local controller="${CONTROLLER_HOSTNAME:-}"
+
+    if [[ -z "$controller" ]]; then
+        prompt_input "Controller hostname or IP"
+        controller="$REPLY"
+    fi
+
+    local default_user
+    default_user=$(whoami)
+    prompt_input "SSH username for ${controller}" "$default_user"
+    local ssh_user="$REPLY"
+
+    local ssh_target="${ssh_user}@${controller}"
+
+    log_info "Fetching MUNGE key from ${ssh_target}..."
+    echo -e "${YELLOW}You may be prompted for your SSH password and/or sudo password.${RESET}"
+    echo
+
+    # Try to fetch the key - need sudo on remote since key is 0400 munge:munge
+    # Use base64 encoding to safely transfer binary data over SSH with tty
+    local tmp_key
+    tmp_key=$(mktemp)
+    local tmp_b64
+    tmp_b64=$(mktemp)
+
+    # Fetch the key as base64 (using -tt for sudo password prompt support)
+    # The base64 encoding avoids binary transfer issues with tty mode
+    if ssh -tt -o ConnectTimeout=10 "$ssh_target" "sudo base64 /etc/munge/munge.key" > "$tmp_b64" 2>/dev/null; then
+        # Remove any tty artifacts (carriage returns, terminal escapes) and decode
+        # Keep only valid base64 characters and newlines
+        tr -cd 'A-Za-z0-9+/=\n' < "$tmp_b64" | base64 -d > "$tmp_key" 2>/dev/null
+
+        # Verify we got something reasonable (should be 1024 bytes for our generated keys, or 128 for default)
+        local key_size
+        key_size=$(stat -c%s "$tmp_key" 2>/dev/null || echo 0)
+        if (( key_size < 128 )); then
+            rm -f "$tmp_key" "$tmp_b64"
+            die "Failed to fetch MUNGE key (file too small or empty). Check sudo permissions on controller."
+        fi
+
+        cp "$tmp_key" "$MUNGE_KEY"
+        rm -f "$tmp_key" "$tmp_b64"
+        log_success "MUNGE key fetched from ${controller}"
+    else
+        rm -f "$tmp_key" "$tmp_b64"
+        echo
+        log_error "Failed to fetch MUNGE key from ${controller}."
+        log_info "Ensure you can SSH to the controller and have sudo access."
+        log_info "You may need to run: ssh-copy-id ${ssh_target}"
+        die "Could not retrieve MUNGE key."
+    fi
+}
+
 import_munge_key() {
     log_info "This node needs the MUNGE key from the controller."
     echo
@@ -91,18 +145,23 @@ import_munge_key() {
         fi
     fi
 
-    echo -e "You can provide the MUNGE key in one of two ways:"
-    echo -e "  ${CYAN}1)${RESET} Specify a path to a key file (e.g., copied via scp)"
-    echo -e "  ${CYAN}2)${RESET} Paste the base64-encoded key content"
+    echo -e "How would you like to provide the MUNGE key?"
+    echo -e "  ${CYAN}1)${RESET} Fetch from controller via SSH (recommended)"
+    echo -e "  ${CYAN}2)${RESET} Specify a path to a local key file"
+    echo -e "  ${CYAN}3)${RESET} Paste the base64-encoded key content"
     echo
 
-    menu_select "How would you like to provide the MUNGE key?" \
-        "Path to key file" \
+    menu_select "Choose an option:" \
+        "Fetch from controller via SSH (recommended)" \
+        "Path to local key file" \
         "Paste base64-encoded key"
     local method="$REPLY"
 
     case "$method" in
         1)
+            fetch_munge_key_from_controller
+            ;;
+        2)
             prompt_input "Path to MUNGE key file"
             local key_path="$REPLY"
 
@@ -113,7 +172,7 @@ import_munge_key() {
             cp "$key_path" "$MUNGE_KEY"
             log_success "MUNGE key imported from ${key_path}"
             ;;
-        2)
+        3)
             echo -e "On the controller, run: ${CYAN}sudo base64 ${MUNGE_KEY}${RESET}"
             echo "Then paste the output below."
             prompt_input "Base64-encoded MUNGE key"

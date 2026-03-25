@@ -39,6 +39,12 @@ render_template "$template" "$output_file" vars
 - slurmdbd.conf: `0600 slurm:slurm` (contains DB password)
 - munge.key: `0400 munge:munge`
 
+### MUNGE Key Import
+For non-controller nodes, `import_munge_key()` in munge.sh offers three methods:
+1. **Fetch from controller via SSH** (recommended) — `fetch_munge_key_from_controller()` uses SSH+sudo to retrieve the key, with base64 encoding to handle binary transfer safely
+2. **Path to local file** — user pre-copies the key via scp
+3. **Paste base64** — user runs `sudo base64 /etc/munge/munge.key` on controller and pastes output
+
 ### User Prompts
 - `confirm "question" "default_yes|default_no"` — returns 0/1
 - `prompt_input "label" ["default"]` — result in `$REPLY`
