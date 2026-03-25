@@ -75,6 +75,7 @@ You'll be prompted to optionally remove:
 - State and log directories (`/var/lib/slurm`, `/var/log/slurm`, `/var/spool/slurm`)
 - Slurm database from MariaDB (if applicable)
 - MariaDB server (if installed by this installer)
+- MariaDB container and data volume (if installed by this installer)
 - chrony (if installed by this installer)
 
 The installer tracks which packages it installed (vs. pre-existing) in `/etc/slurm/.installer-state`. Only packages the installer actually installed will be offered for removal, ensuring pre-existing services aren't accidentally deleted.
@@ -132,6 +133,22 @@ systemctl status slurm-mariadb
 docker logs slurm-mariadb   # or: podman logs slurm-mariadb
 
 # Restart the container
+systemctl restart slurm-mariadb
+
+# Connect to database
+mysql -h 127.0.0.1 -u slurm -p
+```
+
+**Re-running the installer:**
+
+If you re-run the installer on a node with an existing MariaDB installation (native or container), you'll be prompted to reuse it. This preserves your existing database and credentials.
+
+**Upgrading the container image:**
+```bash
+# Pull latest image
+docker pull mariadb:lts   # or: podman pull mariadb:lts
+
+# Restart to use new image
 systemctl restart slurm-mariadb
 ```
 
@@ -473,6 +490,28 @@ Common causes:
 - **slurmd**: Can't reach controller, slurm.conf mismatch
 - **slurmctld**: Port 6817 in use, invalid slurm.conf syntax
 - **slurmdbd**: MariaDB not running, wrong DB password in slurmdbd.conf
+- **slurm-mariadb**: Container failed to start, check container logs
+
+### MariaDB container issues
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| `slurm-mariadb` won't start | Container runtime not running | Start docker/podman: `systemctl start docker` or `systemctl start podman` |
+| Container starts but slurmdbd fails | Wrong credentials in slurmdbd.conf | Verify StorageHost=127.0.0.1 (not localhost) in slurmdbd.conf |
+| "Connection refused" errors | Container not ready | Wait for container to initialize, check logs: `docker logs slurm-mariadb` |
+| Data not persisting | Volume mount issue | Verify `/var/lib/slurm-mariadb` exists and has correct permissions |
+
+**Checking container health:**
+```bash
+# Check if container is running
+systemctl status slurm-mariadb
+
+# View container logs
+docker logs slurm-mariadb   # or: podman logs slurm-mariadb
+
+# Test database connection
+mysql -h 127.0.0.1 -u slurm -p -e "SELECT 1"
+```
 
 ### Permission denied running sinfo/srun
 
@@ -499,6 +538,7 @@ This installer provides a straightforward single-cluster setup. Feature support:
 | NVIDIA GPU scheduling | Supported | Auto-detected via nvidia-smi, uses NVML |
 | AMD GPU scheduling | Supported | Auto-detected via rocm-smi, uses RSMI |
 | Intel GPUs | Not supported | No auto-detection support |
+| Containerized MariaDB | Supported | Docker or Podman, data in /var/lib/slurm-mariadb |
 | High availability | Not supported | Single controller only, no failover |
 | Federation | Not supported | Single cluster only |
 | Non-Debian distros | Not supported | Debian 11, 12, 13 only |
