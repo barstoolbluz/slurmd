@@ -231,6 +231,18 @@ test_ssh_connectivity() {
     local ssh_target="${SSH_USER}@${node}"
     local ssh_err
 
+    # For sudo_password mode, user may not have SSH keys - use interactive test
+    if [[ "$SSH_MODE" == "sudo_password" ]]; then
+        echo -e "  Testing ${node}... (you may be prompted for your password)"
+        if ! ssh -o ConnectTimeout=10 "$ssh_target" 'echo ok' &>/dev/null; then
+            log_error "  ${node}: SSH connection failed"
+            log_info "    Check that you can: ssh ${ssh_target}"
+            return 1
+        fi
+        return 0
+    fi
+
+    # For key-based modes, use BatchMode to verify keys work
     if ! ssh_err=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$ssh_target" 'echo ok' 2>&1); then
         if [[ "$ssh_err" == *"Host key verification"* ]]; then
             log_error "  ${node}: Host key not accepted"
