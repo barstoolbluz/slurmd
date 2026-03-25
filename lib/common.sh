@@ -792,10 +792,11 @@ EOF
 }
 
 # Install packages via apt, skipping already-installed ones.
+# Uses --no-install-recommends to avoid pulling in unwanted plugin meta-packages.
 apt_install() {
     local packages=("$@")
     log_info "Installing packages: ${packages[*]}"
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${packages[@]}"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${packages[@]}"
 }
 
 # Ensure apt cache is reasonably fresh (updated within last hour).
