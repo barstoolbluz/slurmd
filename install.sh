@@ -250,20 +250,19 @@ fetch_node_hardware() {
     local node="$1"
     local ssh_target="${SSH_USER}@${node}"
     local hw_line=""
-    local slurmd_cmd="/usr/sbin/slurmd -C 2>/dev/null | head -1"
+    # slurmd -C doesn't need root - it just prints hardware config
+    # Try slurmd in PATH first, fall back to /usr/sbin/slurmd
+    local slurmd_cmd="(slurmd -C 2>/dev/null || /usr/sbin/slurmd -C 2>/dev/null) | head -1"
 
     case "$SSH_MODE" in
         root)
             hw_line=$(ssh -q -o BatchMode=yes -o ConnectTimeout=10 \
                 "root@${node}" "$slurmd_cmd" 2>/dev/null) || return 1
             ;;
-        sudo_passwordless)
-            hw_line=$(ssh -q -o BatchMode=yes -o ConnectTimeout=10 \
-                "$ssh_target" "sudo $slurmd_cmd" 2>/dev/null) || return 1
-            ;;
-        sudo_password)
-            hw_line=$(ssh -o ConnectTimeout=10 \
-                "$ssh_target" "sudo $slurmd_cmd" 2>/dev/null) || return 1
+        sudo_passwordless|sudo_password)
+            # No sudo needed for slurmd -C (read-only hardware detection)
+            hw_line=$(ssh -q -o ConnectTimeout=10 \
+                "$ssh_target" "$slurmd_cmd" 2>/dev/null) || return 1
             ;;
     esac
 
