@@ -630,7 +630,8 @@ distribute_to_node_sudo_password() {
 
     # Cleanup: close SSH connection and remove temp files
     # Note: variables are expanded now (at trap setup time) to avoid scope issues
-    trap "ssh -q -o ControlPath='${ssh_socket}' -O exit '${ssh_target}' 2>/dev/null || true; rm -rf '${local_tmp}'" RETURN
+    # Use -n to prevent stdin consumption (trap may run during while-read loop)
+    trap "ssh -q -n -o ControlPath='${ssh_socket}' -O exit '${ssh_target}' 2>/dev/null || true; rm -rf '${local_tmp}'" RETURN
 
     # Read files locally (may need sudo)
     local_read_file /etc/munge/munge.key > "${local_tmp}/munge.key" || {
@@ -650,8 +651,9 @@ distribute_to_node_sudo_password() {
     # NOTE: gres.conf is NOT distributed - it's node-specific (GPU type varies)
 
     # Establish master SSH connection (will prompt for password once)
+    # Use </dev/tty to read password from terminal, not from while-read loop's stdin
     log_info "  Connecting to ${node} (you will be prompted for your password once)..."
-    if ! ssh -q $ssh_opts "$ssh_target" "mkdir -p ${tmp_dir}"; then
+    if ! ssh -q $ssh_opts "$ssh_target" "mkdir -p ${tmp_dir}" </dev/tty; then
         log_error "  Failed to connect to ${node}"
         return 1
     fi
@@ -713,7 +715,7 @@ sudo systemctl restart slurmd 2>/dev/null || true"
     if ! echo "$script_content" | ssh -q $ssh_opts "$ssh_target" "cat > ${remote_script} && chmod +x ${remote_script}"; then
         log_error "  Failed to create install script on ${node}"
         failed=true
-        ssh -q $ssh_opts "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
+        ssh -q -n $ssh_opts "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
         return 1
     fi
 
@@ -721,7 +723,7 @@ sudo systemctl restart slurmd 2>/dev/null || true"
     if ! ssh -tt $ssh_opts "$ssh_target" "${remote_script}" </dev/tty; then
         log_error "  Failed to install files on ${node}"
         failed=true
-        ssh -q $ssh_opts "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
+        ssh -q -n $ssh_opts "$ssh_target" "rm -rf '${tmp_dir}'" 2>/dev/null || true
     fi
 
     $failed && return 1
