@@ -33,10 +33,14 @@ The installer walks you through selecting a node role and configuring the cluste
 ## Cluster setup order
 
 1. **Controller (+ Database)** first — generates the MUNGE key and slurm.conf
-2. **Compute nodes** — run `slurmd -C` on each to get hardware lines, add them to slurm.conf on the controller
-3. **Distribute configs** to all nodes (choose one method):
-   - **Automatic:** `./install.sh --setup-nodes` (requires SSH key auth)
-   - **Manual:** Copy `/etc/munge/munge.key`, `/etc/slurm/slurm.conf`, and `/etc/slurm/cgroup.conf` to each node (gres.conf is generated locally on each node)
+2. **Compute nodes** — run the installer on each node, selecting "Compute node" role
+   - The installer shows a NodeName line based on detected hardware
+   - Send this line to the cluster admin to add to slurm.conf on the controller
+   - The installer can fetch configs from the controller via SSH, or you can skip and push them later
+3. **Distribute configs** from the controller to all nodes (if not fetched during install):
+   - **Automatic:** `./install.sh --setup-nodes` on the controller (pushes munge.key, slurm.conf, cgroup.conf)
+   - **Manual:** Copy `/etc/munge/munge.key`, `/etc/slurm/slurm.conf`, and `/etc/slurm/cgroup.conf` to each node
+   - Note: gres.conf is generated locally on each node based on its GPU type — do not copy it
 4. **Database node** (if separate from controller) — run installer before distributing configs
 5. **Login nodes** — run installer, then distribute configs
 6. On the controller: `scontrol reconfigure` to apply changes
