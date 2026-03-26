@@ -23,6 +23,72 @@ packages are cached locally and subsequent jobs start instantly.
 That's it. No shared filesystem, no binary cache, no NFS — just install Flox
 on your nodes, push an environment to FloxHub, and reference it in job scripts.
 
+## What `flox activate -r` Actually Does
+
+When you run `flox activate -r owner/env -- <command>`, this is the sequence:
+
+1. **Check local cache** — looks for environment metadata in
+   `~/.cache/flox/remote/<owner>/<env>/.flox/` (manifest, lockfile).
+2. **Contact FloxHub** (HTTPS) — checks for updates to the environment. Also
+   contacts GitHub to fetch the environment source if needed. This happens on
+   every activation, even for cached environments.
+3. **Resolve packages** — the lockfile (`manifest.lock`) contains specific
+   `/nix/store/` paths for every package. If those paths are already in the
+   local store, no download is needed. Missing packages are fetched from Nix
+   substituters (cache.flox.dev, cache.nixos.org) via the local `nix-daemon`.
+4. **Build composite environment** — Nix builds an "environment" store path
+   (`/nix/store/...-environment-develop`) that contains symlinks to all
+   individual package paths. This is what `$FLOX_ENV` points to.
+5. **Create run symlink** — a symlink is created at
+   `~/.cache/flox/run/<owner>/<system>.<env>.<mode>` pointing to the composite
+   store path.
+6. **Set environment variables** — `PATH` gets the composite `bin/` directory,
+   `$FLOX_ENV`, `$FLOX_ENV_CACHE`, `$FLOX_ENV_PROJECT` are set.
+7. **Run hooks** — the `[hook]` on-activate script runs (if defined).
+8. **Execute command** — spawns `<command>` in a subshell with the activated
+   environment.
+
+### Key environment variables during activation
+
+| Variable | Value | Persists across activations? |
+|----------|-------|----------------------------|
+| `$FLOX_ENV` | `/nix/store/...-environment-develop` (composite of all packages) | Rebuilt each time |
+| `$FLOX_ENV_CACHE` | `~/.cache/flox/remote/<owner>/<env>/.flox/cache` | Yes (local to node) |
+| `$FLOX_ENV_PROJECT` | Current working directory (where `flox activate` was run) | N/A |
+
+### Trust and non-interactive activation
+
+Activating someone else's environment runs their hooks, which could execute
+arbitrary code. Flox handles this with trust:
+
+- **Your own environments** (`youruser/env`) are always trusted automatically.
+- **Other users' environments** prompt for confirmation — this will **hang in
+  a Slurm batch job**. To avoid this:
+  - Use `-t` flag: `flox activate -r otheruser/env -t -- cmd`
+  - Pre-configure trust: `flox config --set trusted_environments.\"otheruser/env\" trust`
+
+### Network requirements
+
+`flox activate -r` contacts FloxHub on every invocation (even for cached
+environments) to check for updates. This means compute nodes need outbound
+HTTPS access to:
+- FloxHub API (hub.flox.dev)
+- GitHub (github.com — for environment source)
+- Nix caches (cache.flox.dev, cache.nixos.org — for package downloads)
+
+If your compute nodes are air-gapped or have restricted internet access,
+use the LAN binary cache approach (§5.3) and local `.flox/` directories
+instead of `flox activate -r`.
+
+### Activation modes
+
+Flox supports two activation modes (controlled by `-m` flag or manifest setting):
+- **dev** (default) — includes all packages, suitable for development/interactive use
+- **run** — minimal runtime-only packages (if `runtime-packages` is configured)
+
+For Slurm jobs, the default `dev` mode is usually what you want unless you've
+specifically configured `runtime-packages` in your builds.
+
 ## Technical Notes
 
 Flox is built on Nix. The `flox` binary itself lives inside `/nix/store/` (with
