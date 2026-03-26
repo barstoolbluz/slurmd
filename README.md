@@ -57,11 +57,24 @@ After setting up the controller, use `--setup-nodes` to automatically distribute
 
 This will:
 - Read node definitions from `/etc/slurm/slurm.conf`
-- Optionally review/update existing node configurations (fetch hardware via SSH)
+- Optionally review/update existing node configurations
 - Copy munge.key, slurm.conf, and cgroup.conf to each node
 - Restart munge and slurmd on remote nodes
 - Verify munge authentication to each node
 - Run `scontrol reconfigure` on the controller
+
+### Updating node configurations remotely
+
+When prompted "Review or update node configurations?", you can update any node's hardware config without logging into it:
+
+1. Select **"Update via SSH"** for a node
+2. The installer SSHes to the node and runs `slurmd -C`
+3. Review the detected hardware and confirm to update slurm.conf
+
+This is useful for:
+- Adding new nodes without manually copying `slurmd -C` output
+- Refreshing configs after hardware upgrades (RAM, CPUs)
+- Verifying that slurm.conf matches actual hardware
 
 > **Note:** gres.conf is NOT distributed. Each node generates its own gres.conf based on locally installed GPU plugins (`slurm-wlm-nvml-plugin` for NVIDIA, `slurm-wlm-rsmi-plugin` for AMD).
 
@@ -358,7 +371,26 @@ srun -N2 hostname        # Should return both hostnames
 ### On the new compute node:
 
 1. Run the installer and select "Compute node"
-2. Get the hardware detection line:
+2. When prompted for slurm.conf, choose "Skip" (configs will be pushed from controller)
+
+### On the controller:
+
+**Option A: Add node config via SSH (recommended)**
+
+1. Add a placeholder NodeName line to `/etc/slurm/slurm.conf`:
+   ```
+   NodeName=compute02 CPUs=1 RealMemory=1000 State=UNKNOWN
+   ```
+2. Add the node to the partition (e.g., `Nodes=compute01,compute02`)
+3. Run `--setup-nodes` and select "Update via SSH" for the new node:
+   ```bash
+   ./install.sh --setup-nodes
+   ```
+   This SSHes to the node, runs `slurmd -C`, and updates slurm.conf with accurate hardware.
+
+**Option B: Add node config manually**
+
+1. On the compute node, get the hardware detection line:
    ```bash
    slurmd -C
    ```
@@ -366,26 +398,18 @@ srun -N2 hostname        # Should return both hostnames
    ```
    NodeName=compute02 CPUs=16 RealMemory=64000 Sockets=1 CoresPerSocket=8 ThreadsPerCore=2 State=UNKNOWN
    ```
-
-### On the controller:
-
-1. Add the NodeName line to `/etc/slurm/slurm.conf`
-2. Add the node to the partition (e.g., `Nodes=compute01,compute02`)
-3. Distribute the updated config:
+2. Add this NodeName line to `/etc/slurm/slurm.conf` on the controller
+3. Add the node to the partition (e.g., `Nodes=compute01,compute02`)
+4. Distribute the config:
    ```bash
    ./install.sh --setup-nodes
    ```
-   Or manually copy slurm.conf to the new node.
 
-4. Reconfigure the controller:
-   ```bash
-   scontrol reconfigure
-   ```
+### After either option:
 
-5. Verify the node appears:
-   ```bash
-   sinfo
-   ```
+```bash
+sinfo    # Verify node appears
+```
 
 > **Note:** Node ranges like `compute[01-10]` in slurm.conf are supported, but `--setup-nodes` can only distribute to explicitly named nodes. Ranges require manual distribution.
 
