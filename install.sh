@@ -383,9 +383,10 @@ test_ssh_connectivity() {
     local ssh_err
 
     # For sudo_password mode, user may not have SSH keys - use interactive test
+    # Use -n to prevent SSH from consuming stdin (breaks while-read loops)
     if [[ "$SSH_MODE" == "sudo_password" ]]; then
         echo -e "  Testing ${node}... (you may be prompted for your password)"
-        if ! ssh -o ConnectTimeout=10 "$ssh_target" 'echo ok' &>/dev/null; then
+        if ! ssh -n -o ConnectTimeout=10 "$ssh_target" 'echo ok' &>/dev/null; then
             log_error "  ${node}: SSH connection failed"
             log_info "    Check that you can: ssh ${ssh_target}"
             return 1
