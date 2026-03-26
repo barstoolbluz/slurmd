@@ -12,26 +12,47 @@ nodes, providing reproducible, declarative dependency management for HPC workloa
 - No shared filesystem is assumed (the installer distributes files via SCP)
 - Flox is already installed on the controller
 
+## Important: How Flox Works
+
+Flox is built on Nix. The `flox` binary itself lives inside `/nix/store/` (with
+a symlink at `/usr/bin/flox`). Flox uses the `nix-daemon` for store operations,
+communicating via a Unix socket at `/nix/var/nix/daemon-socket/socket`.
+
+This means every node that runs `flox activate` needs:
+1. A local, writable `/nix/var` (for the daemon socket and SQLite database)
+2. A running `nix-daemon` (installed automatically by the Flox installer)
+3. The required packages present in `/nix/store`
+
+A naive read-only NFS mount of `/nix` does **not** work because:
+- Unix domain sockets do not work over NFS
+- `nix-daemon` needs write access to `/nix/var`
+- `flox activate` connects to the local daemon socket on every invocation
+
 ## Architecture Overview
 
 ```
 Controller (this node)
-├── Flox installed
-├── /nix/store (local)
+├── Flox installed (/usr/bin/flox → /nix/store/.../bin/flox)
+├── /nix/store (local, writable)
 ├── Environments authored here or pulled from FloxHub
 │
-├── Option A: NFS-export /nix to compute nodes (recommended for clusters with shared storage)
-│   └── Compute nodes mount /nix read-only — no per-node package downloads
+├── Option A: LAN binary cache (recommended for larger clusters)
+│   ├── Controller runs nix-serve on the LAN
+│   ├── Compute nodes have independent Flox installs
+│   └── Packages download from controller over HTTP instead of the internet
 │
-└── Option B: Flox installed independently on each compute node (no shared storage)
-    └── Each node pulls environments from FloxHub on first use — higher disk/bandwidth cost
+└── Option B: Independent Flox per node (simplest setup)
+    └── Each node pulls environments from FloxHub directly
 ```
 
-Choose **one** of Option A or Option B based on whether you have or want shared storage.
+Choose **one** of Option A or Option B based on your cluster size and network.
 
 ---
 
-## Phase 1: Install Flox on Compute Nodes
+## Phase 1: Install Flox on All Nodes
+
+Every node (controller and compute) needs its own Flox installation with a
+local, writable `/nix`.
 
 ### 1.1 Install Flox on the controller (if not already)
 
@@ -55,7 +76,10 @@ ssh root@compute01 'curl -fsSL https://install.flox.dev | bash'
 
 ```bash
 # Extract compute node hostnames from slurm.conf
-NODES=$(grep -oP '^NodeName=\K[^\s]+' /etc/slurm/slurm.conf | tr ',' '\n')
+# Note: this skips node ranges like node[01-10] — expand those manually
+NODES=$(grep -oP '^NodeName=\K[^\s]+' /etc/slurm/slurm.conf \
+    | grep -v '\[' \
+    | tr ',' '\n')
 
 for node in $NODES; do
     echo "=== Installing Flox on $node ==="
@@ -84,61 +108,92 @@ done
 
 ---
 
-## Phase 2: Choose a /nix/store Strategy
+## Phase 2: Choose a Package Distribution Strategy
 
-### Option A: Shared /nix/store via NFS (recommended)
+Both options require Flox installed on every node (Phase 1). The difference is
+how packages get into each node's `/nix/store`.
 
-This avoids duplicating packages across nodes. All nodes share the controller's
-Nix store.
+### Option A: LAN Binary Cache (recommended for larger clusters)
 
-**On the controller (NFS server):**
+Run a Nix binary cache on the controller so compute nodes download packages
+over the LAN instead of the internet. This is faster and reduces external
+bandwidth.
 
-```bash
-# Install NFS server if not present
-apt-get install -y nfs-kernel-server
-
-# Export /nix read-only to compute nodes
-# Adjust the network/hostnames to match your cluster
-echo '/nix  192.168.1.0/24(ro,no_root_squash,no_subtree_check)' >> /etc/exports
-exportfs -ra
-systemctl restart nfs-kernel-server
-```
-
-**On each compute node (NFS client):**
+**On the controller — install and start nix-serve:**
 
 ```bash
-apt-get install -y nfs-common
+# Install nix-serve (a lightweight HTTP binary cache server)
+nix-env -iA nixpkgs.nix-serve
 
-# Back up the local /nix if it exists from the Flox install
-# (The Flox binary itself lives in /usr/local or similar, not /nix)
-mv /nix /nix.local.bak 2>/dev/null || true
+# Generate a signing key pair for the cache
+nix-store --generate-binary-cache-key controller-cache cache-priv-key.pem cache-pub-key.pem
+sudo mv cache-priv-key.pem /etc/nix/
+sudo chmod 600 /etc/nix/cache-priv-key.pem
 
-# Mount the controller's /nix
-mkdir -p /nix
-echo 'controller:/nix  /nix  nfs  ro,hard,intr  0  0' >> /etc/fstab
-mount /nix
+# Start nix-serve (serves /nix/store over HTTP on port 5000)
+# For production, create a systemd unit instead of running in foreground
+nix-serve --port 5000 --sign /etc/nix/cache-priv-key.pem &
 ```
 
-Replace `controller` with the actual hostname or IP of your controller node.
+Create a systemd unit for persistence (`/etc/systemd/system/nix-serve.service`):
 
-**Verify:**
+```ini
+[Unit]
+Description=Nix binary cache server
+After=network.target
+
+[Service]
+ExecStart=/root/.nix-profile/bin/nix-serve --port 5000 --sign /etc/nix/cache-priv-key.pem
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ```bash
-ssh root@compute01 'ls /nix/store | head -5'
+sudo systemctl daemon-reload
+sudo systemctl enable --now nix-serve
 ```
 
-> **Note:** With NFS-shared /nix, environments built or pulled on the controller
-> are instantly available on all compute nodes. No `flox pull` needed on each node.
+**On each compute node — configure the controller as a substituter:**
 
-### Option B: Independent /nix/store per Node (no NFS)
+```bash
+# Get the public key from the controller
+PUBLIC_KEY=$(cat cache-pub-key.pem)
 
-Each compute node maintains its own /nix/store. Environments are pulled from
+# Add to each compute node's nix.conf
+ssh root@compute01 "cat >> /etc/nix/nix.conf << EOF
+extra-substituters = http://controller:5000
+extra-trusted-public-keys = $PUBLIC_KEY
+EOF
+systemctl restart nix-daemon"
+```
+
+Replace `controller` with the actual hostname or IP of the controller node.
+
+**How it works:** When a compute node runs `flox activate`, `nix-daemon` checks
+the controller's binary cache first. If the package is there (because you
+already built/pulled the environment on the controller), it downloads over the
+LAN. Cache misses fall through to the default substituters (cache.nixos.org,
+cache.flox.dev).
+
+**Pre-populate the cache** by activating environments on the controller first:
+
+```bash
+flox activate -r youruser/my-env -- true
+```
+
+### Option B: Independent Flox per Node (simplest setup)
+
+Each compute node maintains its own `/nix/store`. Environments are pulled from
 FloxHub on first activation and cached locally.
 
-**Pros:** No shared storage dependency, nodes are fully independent.
-**Cons:** First activation on each node downloads all packages. More disk usage.
+**Pros:** No additional infrastructure. Nodes are fully independent.
+**Cons:** First activation on each node downloads all packages from the internet.
+More total disk usage across the cluster.
 
-No additional setup beyond Phase 1 — Flox installs its own /nix/store.
+No additional setup beyond Phase 1 — Flox installs its own `/nix/store` on
+each node.
 
 To pre-warm a node's cache (optional):
 
@@ -152,7 +207,7 @@ ssh root@compute01 'flox activate -r youruser/my-env -- true'
 
 You need an environment that compute nodes can activate. Two approaches:
 
-### 3a. FloxHub Remote Environments (works with both Options A and B)
+### 3a. FloxHub Remote Environments (recommended)
 
 Create and push an environment from the controller:
 
@@ -163,46 +218,30 @@ flox install python311Full uv gcc cmake   # whatever your workload needs
 flox activate -- python3 --version        # verify it works
 
 # Push to FloxHub (requires flox auth login first)
+flox auth login
 git init && git add -A && git commit -m "Initial environment"
-# Add a remote, then:
+git remote add origin <your-git-remote-url>
+git push -u origin main
 flox push
 ```
 
 Users reference it in jobs as `flox activate -r youruser/my-hpc-stack -- ...`
 
-### 3b. Project-Local Environments (best with Option A / NFS)
+### 3b. Project-Local Environments (requires shared filesystem)
 
-If your project directory lives on shared storage, the `.flox/` directory is
-already accessible to all nodes:
+If your project directory lives on shared storage (NFS home directories, Lustre,
+etc.), the `.flox/` directory is accessible to all nodes:
 
 ```bash
 cd /shared/projects/my-project
 flox init
 flox install python311Full numpy
-# .flox/ is visible to all nodes via NFS
 ```
 
-Jobs `cd` to the project and activate directly. With NFS-shared /nix, the
-packages referenced by `.flox/` are already in the shared store.
-
-### 3c. Local Environments Distributed via SCP (no FloxHub, no NFS)
-
-If you don't want to use FloxHub and don't have shared storage, you can
-distribute `.flox/` directories to each node:
-
-```bash
-# On controller
-cd /path/to/project
-tar czf /tmp/flox-env.tar.gz .flox/
-
-# Distribute
-for node in $NODES; do
-    scp /tmp/flox-env.tar.gz root@"$node":/path/to/project/
-    ssh root@"$node" "cd /path/to/project && tar xzf flox-env.tar.gz && rm flox-env.tar.gz"
-done
-```
-
-> This is the least convenient option. Prefer FloxHub or NFS.
+Jobs `cd` to the project and activate directly. Each node still needs the
+packages in its local `/nix/store` — the `.flox/` directory is just metadata.
+With Option A (LAN cache), packages download quickly from the controller.
+With Option B, they download from the internet on first use.
 
 ---
 
@@ -235,7 +274,7 @@ sbatch job.sh
 
 ### 4.2 Multi-Line Job with Flox
 
-For more complex jobs, use a wrapper script or heredoc:
+For complex jobs, write a separate script and invoke it through Flox:
 
 ```bash
 #!/bin/bash
@@ -243,19 +282,23 @@ For more complex jobs, use a wrapper script or heredoc:
 #SBATCH --output=train-%j.out
 #SBATCH --gres=gpu:1
 
-# Create a temporary script with the actual work
-cat > /tmp/slurm-work-$SLURM_JOB_ID.sh << 'WORK'
-#!/bin/bash
+flox activate -r youruser/ml-stack -- bash -c '
 set -euo pipefail
 echo "Python: $(python3 --version)"
-echo "Working dir: $(pwd)"
 cd "$SLURM_SUBMIT_DIR"
 python3 train.py --epochs 100
-WORK
-chmod +x /tmp/slurm-work-$SLURM_JOB_ID.sh
+'
+```
 
-flox activate -r youruser/ml-stack -- /tmp/slurm-work-$SLURM_JOB_ID.sh
-rm -f /tmp/slurm-work-$SLURM_JOB_ID.sh
+Or keep the work in a separate script (cleaner for large jobs):
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=training
+#SBATCH --output=train-%j.out
+#SBATCH --gres=gpu:1
+
+flox activate -r youruser/ml-stack -- ./train_wrapper.sh
 ```
 
 ### 4.3 Project-Local Environment (shared storage)
@@ -284,16 +327,18 @@ flox activate -r youruser/cuda-ml-stack -- python3 train_gpu.py
 
 ## Phase 5: Optional Enhancements
 
-### 5.1 Slurm Prolog — Pre-Cache Environments
+### 5.1 Slurm Prolog — Pre-Cache Environments on Compute Nodes
 
-Add a prolog script so environments are warm before jobs start. This avoids
-first-run download latency inside job time.
+Add a compute-node prolog script so environments are warm before jobs start.
+This avoids first-run download latency inside job wall time.
 
-Create `/etc/slurm/prolog.d/flox-cache.sh`:
+Create `/etc/slurm/prolog.d/flox-cache.sh` on each compute node:
 
 ```bash
 #!/bin/bash
-# Pre-cache Flox environment if SLURM_FLOX_ENV is set
+# Pre-cache Flox environment if SLURM_FLOX_ENV is set.
+# Note: Prolog runs as root. We pre-warm the store paths so they're
+# available when the job user activates the same environment.
 if [ -n "${SLURM_FLOX_ENV:-}" ]; then
     flox activate -r "$SLURM_FLOX_ENV" -- true 2>/dev/null || true
 fi
@@ -302,22 +347,21 @@ fi
 Add to slurm.conf on the controller:
 
 ```
-PrologSlurmctld=/etc/slurm/prolog.d/flox-cache.sh
-```
-
-Or for compute-node-side prolog:
-
-```
 Prolog=/etc/slurm/prolog.d/flox-cache.sh
 ```
 
-Distribute slurm.conf and the prolog script, then `scontrol reconfigure`.
+Distribute slurm.conf and the prolog script to all compute nodes, then
+`scontrol reconfigure`.
 
 Users submit with:
 
 ```bash
 sbatch --export=ALL,SLURM_FLOX_ENV=youruser/ml-stack job.sh
 ```
+
+> **Note:** The prolog runs as root, which warms the `/nix/store` paths (shared
+> across all users on the node). The job user's `flox activate` will then find
+> all packages already present and start instantly.
 
 ### 5.2 Environment Modules Integration
 
@@ -351,11 +395,11 @@ Provide a convenience wrapper at `/usr/local/bin/sflox`:
 ```bash
 #!/bin/bash
 # sflox — submit a Slurm job inside a Flox environment
-# Usage: sflox <flox-env> [sbatch-args...] -- <command>
+# Usage: sflox <flox-env> [sbatch-args...] -- <command> [args...]
 set -euo pipefail
 
 if [ $# -lt 3 ]; then
-    echo "Usage: sflox <flox-env> [sbatch-args...] -- <command>"
+    echo "Usage: sflox <flox-env> [sbatch-args...] -- <command> [args...]"
     echo "Example: sflox youruser/ml-stack --gres=gpu:1 -- python3 train.py"
     exit 1
 fi
@@ -383,13 +427,19 @@ if [ ${#CMD_ARGS[@]} -eq 0 ]; then
     exit 1
 fi
 
+# Build a properly quoted command string for the job script
+QUOTED_CMD=""
+for arg in "${CMD_ARGS[@]}"; do
+    QUOTED_CMD+="$(printf '%q ' "$arg")"
+done
+
 # Create job script
 JOBSCRIPT=$(mktemp /tmp/sflox-XXXXXX.sh)
 cat > "$JOBSCRIPT" << EOF
 #!/bin/bash
 #SBATCH --job-name=flox-job
 #SBATCH --output=flox-%j.out
-flox activate -r "$FLOX_ENV" -- ${CMD_ARGS[@]}
+flox activate -r "$FLOX_ENV" -- $QUOTED_CMD
 EOF
 
 sbatch "${SBATCH_ARGS[@]}" "$JOBSCRIPT"
@@ -412,14 +462,15 @@ Run through these checks to confirm everything works end-to-end.
 
 - [ ] `flox --version` works
 - [ ] Test environment activates: `flox activate -r youruser/my-env -- echo OK`
-- [ ] If using NFS: `/nix` is exported (`showmount -e localhost`)
+- [ ] If using Option A: `curl http://localhost:5000/nix-cache-info` returns cache info
 
 ### Compute Nodes
 
 For each compute node:
 
 - [ ] `ssh root@nodeXX 'flox --version'` returns a version
-- [ ] If NFS: `ssh root@nodeXX 'mount | grep /nix'` shows the NFS mount
+- [ ] `ssh root@nodeXX 'systemctl is-active nix-daemon'` returns `active`
+- [ ] If using Option A: `ssh root@nodeXX 'grep controller /etc/nix/nix.conf'` shows substituter
 - [ ] Environment activates: `ssh root@nodeXX 'flox activate -r youruser/my-env -- echo OK'`
 
 ### Job Submission
@@ -437,23 +488,24 @@ For each compute node:
 
 | Problem | Likely Cause | Fix |
 |---------|-------------|-----|
-| `flox: command not found` on compute node | Flox not installed or not in PATH | Install Flox; check that `/usr/local/bin` or Flox install path is in the job's PATH |
-| `error: getting status of /nix/store/...` | NFS not mounted or stale mount | Verify NFS mount on compute node; `mount /nix` or check `/etc/fstab` |
+| `flox: command not found` on compute node | Flox not installed or not in PATH | Install Flox; verify `/usr/bin/flox` symlink exists |
+| `error: getting status of /nix/store/...` | Store path not present on this node | Pre-warm with `flox activate -r env -- true`; if using Option A, verify binary cache is reachable |
 | First job very slow | Downloading packages on first activation | Pre-warm with prolog (§5.1) or `flox activate -r env -- true` on each node |
 | `flox activate` hangs in job | Interactive prompt in hook | Ensure hooks are non-interactive; use `flox activate -- cmd` (non-interactive mode) |
-| Permission denied on /nix | NFS export missing `no_root_squash` | Update `/etc/exports` with `no_root_squash`, re-export |
+| `nix-daemon` not running | Service stopped or failed | `systemctl restart nix-daemon` on the affected node |
+| Binary cache not reachable | Firewall or hostname resolution | Verify `curl http://controller:5000/nix-cache-info` from compute node |
 | Environment not found | Not pushed to FloxHub / typo in name | `flox push` from controller; verify with `flox search` |
 
 ---
 
 ## Decision Matrix: Which Option to Choose
 
-| Factor | Option A (NFS /nix) | Option B (Independent) |
-|--------|---------------------|----------------------|
-| Shared storage available | Required | Not needed |
-| Disk usage | Low (single copy) | High (copy per node) |
-| First-job latency | None (already in store) | High (downloads packages) |
-| Network dependency | NFS must be up | Only for FloxHub pull |
-| Node independence | Nodes depend on NFS | Fully independent |
-| Setup complexity | Moderate (NFS config) | Low (just install Flox) |
-| Best for | Persistent clusters with shared FS | Cloud/ephemeral nodes, small clusters |
+| Factor | Option A (LAN binary cache) | Option B (Independent) |
+|--------|----------------------------|----------------------|
+| Additional infra | nix-serve on controller | None |
+| Disk usage | Medium (shared cache avoids re-downloads) | Higher (each node downloads independently) |
+| First-job latency | Low (LAN download) | High (internet download) |
+| Network dependency | LAN to controller | Internet to FloxHub/cache.nixos.org |
+| Node independence | Needs controller reachable for cache misses | Fully independent |
+| Setup complexity | Moderate (nix-serve + key signing) | Low (just install Flox) |
+| Best for | Larger persistent clusters | Small clusters, cloud/ephemeral nodes |
